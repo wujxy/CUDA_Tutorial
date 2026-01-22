@@ -1,4 +1,4 @@
-#include "../include/optimizer.h"
+#include "../include/fit_model.h"
 #include "../include/cuda_utils.h"
 #include "../include/model_kernels.cuh"
 #include <cuda_runtime.h>
@@ -32,18 +32,19 @@ __global__ void sumKernel(float* __restrict__ output, const float* __restrict__ 
 /**
  * 计算总似然值
  */
-float GradientDescentOptimizer::computeLikelihood(const GaussianParams& params) {
+float SimpleOptimizer::computeLikelihood(const GaussianParams& params) {
     const int threadsPerBlock = 256;
     const int blocksPerGrid = (nbins + threadsPerBlock - 1) / threadsPerBlock;
 
-    // 第一步：计算每个bin的似然
+    // 计算每个bin的似然
     poissonLikelihoodKernel<<<blocksPerGrid, threadsPerBlock>>>(
-        d_expected, d_likelihood, d_observed, d_x_coords, d_y_coords, params, nbins
+        d_expected, d_likelihood, d_observed, params, nbins,
+        x_min, x_max, nx, y_min, y_max, ny
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 第二步：规约求和
+    // 规约求和
     int num_blocks = blocksPerGrid;
     float* d_temp;
     CUDA_CHECK(cudaMalloc(&d_temp, num_blocks * sizeof(float)));
@@ -54,7 +55,6 @@ float GradientDescentOptimizer::computeLikelihood(const GaussianParams& params) 
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    // 如果需要多级规约（当bin数很大时）
     while (num_blocks > 1) {
         int prev_blocks = num_blocks;
         num_blocks = (num_blocks + threadsPerBlock - 1) / threadsPerBlock;
@@ -65,7 +65,6 @@ float GradientDescentOptimizer::computeLikelihood(const GaussianParams& params) 
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
 
-        // 交换指针
         float* swap = d_temp;
         d_temp = d_expected;
         d_expected = swap;
@@ -81,77 +80,45 @@ float GradientDescentOptimizer::computeLikelihood(const GaussianParams& params) 
 /**
  * 计算梯度（数值微分）
  */
-void GradientDescentOptimizer::computeGradient(const GaussianParams& params, float* gradient) {
+void SimpleOptimizer::computeGradient(const GaussianParams& params, float* gradient) {
     const int threadsPerBlock = 256;
 
-    // 使用numericalGradientKernel计算所有6个参数的梯度
+    // 使用CUDA计算所有6个参数的梯度
     numericalGradientKernel<<<6, threadsPerBlock, threadsPerBlock * sizeof(float)>>>(
-        d_gradient, d_observed, d_x_coords, d_y_coords, params, config.gradient_epsilon, nbins
+        d_gradient, d_observed, params, config.gradient_epsilon, nbins,
+        x_min, x_max, nx, y_min, y_max, ny
     );
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // 拷贝回主机
     CUDA_CHECK(cudaMemcpy(gradient, d_gradient, 6 * sizeof(float), cudaMemcpyDeviceToHost));
-
-    // 对每个参数进行自适应归一化
-    // 使用参数值的倒数作为归一化因子
-    float scale[6];
-    scale[0] = 1.0f / (fabsf(params.A) + 100.0f);         // A
-    scale[1] = 1.0f / (fabsf(params.x0) + 0.5f);         // x0
-    scale[2] = 1.0f / (fabsf(params.y0) + 0.5f);         // y0
-    scale[3] = 1.0f / (fabsf(params.sigma_x) + 0.5f);    // sigma_x
-    scale[4] = 1.0f / (fabsf(params.sigma_y) + 0.5f);    // sigma_y
-    scale[5] = 1.0f;                                      // rho (already small)
-
-    for (int i = 0; i < 6; i++) {
-        gradient[i] *= scale[i];
-    }
 }
 
 /**
  * 应用参数约束
  */
-void GradientDescentOptimizer::applyConstraints(GaussianParams& params) {
-    // sigma 必须为正
+void SimpleOptimizer::applyConstraints(GaussianParams& params) {
     params.sigma_x = fmaxf(params.sigma_x, 0.1f);
     params.sigma_y = fmaxf(params.sigma_y, 0.1f);
-
-    // rho 必须在 (-1, 1) 之间
     params.rho = fmaxf(-0.99f, fminf(params.rho, 0.99f));
-
-    // 幅值通常为正
     params.A = fmaxf(params.A, 0.0f);
-}
-
-/**
- * 参数更新
- */
-void GradientDescentOptimizer::updateParams(GaussianParams& params, const float* gradient) {
-    // 直接使用梯度（已经被归一化）
-    params.A        -= config.learning_rate * gradient[0] * 10.0f;     // A 需要较大更新
-    params.x0       -= config.learning_rate * gradient[1];
-    params.y0       -= config.learning_rate * gradient[2];
-    params.sigma_x  -= config.learning_rate * gradient[3];
-    params.sigma_y  -= config.learning_rate * gradient[4];
-    params.rho      -= config.learning_rate * gradient[5] * 0.01f;      // rho 需要更小更新
-
-    applyConstraints(params);
 }
 
 /**
  * 构造函数
  */
-GradientDescentOptimizer::GradientDescentOptimizer(const OptimizerConfig& cfg)
-    : config(cfg), d_observed(nullptr), d_x_coords(nullptr), d_y_coords(nullptr),
-      nbins(0), d_expected(nullptr), d_likelihood(nullptr), d_gradient(nullptr)
+SimpleOptimizer::SimpleOptimizer(const OptimizerConfig& cfg)
+    : config(cfg), d_observed(nullptr), nbins(0),
+      x_min(0), x_max(0), y_min(0), y_max(0), nx(0), ny(0),
+      d_expected(nullptr), d_likelihood(nullptr), d_gradient(nullptr)
 {
 }
 
 /**
  * 析构函数
  */
-GradientDescentOptimizer::~GradientDescentOptimizer() {
+SimpleOptimizer::~SimpleOptimizer() {
     if (d_expected)   cudaFree(d_expected);
     if (d_likelihood) cudaFree(d_likelihood);
     if (d_gradient)   cudaFree(d_gradient);
@@ -160,42 +127,38 @@ GradientDescentOptimizer::~GradientDescentOptimizer() {
 /**
  * 设置数据
  */
-void GradientDescentOptimizer::setData(const Histogram2D& hist) {
+void SimpleOptimizer::setData(const Histogram2D& hist) {
     nbins = hist.nx * hist.ny;
 
-    // 分配临时内存
+    x_min = hist.x_min;
+    x_max = hist.x_max;
+    y_min = hist.y_min;
+    y_max = hist.y_max;
+    nx = hist.nx;
+    ny = hist.ny;
+
     CUDA_CHECK(cudaMallocManaged(&d_expected, nbins * sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&d_likelihood, nbins * sizeof(float)));
     CUDA_CHECK(cudaMallocManaged(&d_gradient, 6 * sizeof(float)));
 
-    // 坐标数组（统一内存）
-    float* x_coords;
-    float* y_coords;
-    CUDA_CHECK(cudaMallocManaged(&x_coords, nbins * sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&y_coords, nbins * sizeof(float)));
-
-    createCoordinateArrays(x_coords, y_coords, hist);
-
-    d_x_coords = x_coords;
-    d_y_coords = y_coords;
     d_observed = hist.data;
 }
 
 /**
  * 执行优化
  */
-OptimizationResult GradientDescentOptimizer::optimize(const GaussianParams& initial_params) {
+OptimizationResult SimpleOptimizer::optimize(const GaussianParams& initial_params) {
     OptimizationResult result;
     result.params = initial_params;
     result.iterations = 0;
     result.converged = false;
 
-    float prev_likelihood = computeLikelihood(initial_params);
-    result.final_likelihood = prev_likelihood;
+    float current_likelihood = computeLikelihood(initial_params);
+    result.final_likelihood = current_likelihood;
 
     if (config.verbose) {
         printf("\n=== Gradient Descent Optimization ===\n");
-        printf("Initial likelihood: %.6f\n", prev_likelihood);
+        printf("Initial likelihood: %.6f\n", current_likelihood);
         printParams("Initial", result.params);
     }
 
@@ -204,27 +167,47 @@ OptimizationResult GradientDescentOptimizer::optimize(const GaussianParams& init
         float gradient[6];
         computeGradient(result.params, gradient);
 
-        // 保存旧参数用于收敛判断
+        // 保存旧参数
         GaussianParams old_params = result.params;
+        float old_likelihood = current_likelihood;
 
-        // 更新参数
-        updateParams(result.params, gradient);
+        // 更新参数（使用较小的固定步长）
+        result.params.A        -= config.learning_rate * gradient[0];
+        result.params.x0       -= config.learning_rate * gradient[1] * 0.01f;  // x0需要较小步长
+        result.params.y0       -= config.learning_rate * gradient[2] * 0.01f;  // y0需要较小步长
+        result.params.sigma_x  -= config.learning_rate * gradient[3] * 0.001f; // sigma需要更小步长
+        result.params.sigma_y  -= config.learning_rate * gradient[4] * 0.001f;
+        result.params.rho      -= config.learning_rate * gradient[5] * 0.01f;
+
+        applyConstraints(result.params);
 
         // 计算新似然
         float new_likelihood = computeLikelihood(result.params);
-        result.final_likelihood = new_likelihood;
         result.iterations = iter + 1;
 
-        // 打印进度
-        if (config.verbose && (iter % 10 == 0 || iter == config.max_iterations - 1)) {
-            printf("Iter %4d: L = %.6f", iter + 1, new_likelihood);
-            printf(" | grad: [%.3e, %.3e, %.3e, %.3e, %.3e, %.3e]\n",
-                   gradient[0], gradient[1], gradient[2],
-                   gradient[3], gradient[4], gradient[5]);
+        // 如果似然增加了，回退并使用更小的步长
+        if (new_likelihood > old_likelihood) {
+            result.params = old_params;
+            config.learning_rate *= 0.5f;  // 降低学习率
+
+            if (config.verbose && iter % 100 == 0) {
+                printf("Iter %4d: Likelihood increased, reducing LR to %.6e\n",
+                       iter + 1, config.learning_rate);
+            }
+            current_likelihood = old_likelihood;
+        } else {
+            current_likelihood = new_likelihood;
+            result.final_likelihood = new_likelihood;
+
+            if (config.verbose && iter % 100 == 0) {
+                printf("Iter %4d: L = %.6f, LR = %.6e\n", iter + 1, new_likelihood, config.learning_rate);
+            }
         }
 
         // 检查收敛
-        float param_change = paramsDiff(old_params, result.params);
+        float param_change = fabsf(result.params.A - old_params.A) +
+                            fabsf(result.params.x0 - old_params.x0) +
+                            fabsf(result.params.y0 - old_params.y0);
         if (param_change < config.tolerance) {
             result.converged = true;
             if (config.verbose) {
@@ -232,14 +215,6 @@ OptimizationResult GradientDescentOptimizer::optimize(const GaussianParams& init
             }
             break;
         }
-
-        // 检查似然是否增加（应该下降）
-        if (new_likelihood > prev_likelihood + 1.0f) {
-            if (config.verbose) {
-                printf("Warning: Likelihood increased! Consider reducing learning rate.\n");
-            }
-        }
-        prev_likelihood = new_likelihood;
     }
 
     if (config.verbose) {

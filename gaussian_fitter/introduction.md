@@ -1,36 +1,48 @@
-# CUDA Poisson Likelihood Gaussian Fitter - 实现介绍
+# CUDA 2D高斯直方图拟合器 - 项目介绍
 
 ## 项目概述
 
-本项目实现了一个使用CUDA加速的泊松似然2D高斯拟合器，用于拟合直方图数据到2D高斯分布模型。核心特点是：
+本项目实现了一个使用CUDA加速的2D高斯直方图拟合器，通过**撒点方式（Monte Carlo采样）**生成测试数据，并使用**泊松似然**进行参数估计。
 
-- **bin-to-bin CUDA计算**: 每个bin的期望值计算在GPU上并行执行
-- **自定义最小化器**: 梯度下降 + 数值微分
+### 核心特点
+
+- **撒点方式生成数据**: 使用C++标准库生成2D高斯样本，通过Cholesky分解处理相关系数
+- **bin-to-bin CUDA并行计算**: 每个bin的期望值和似然计算在GPU上并行执行
+- **正确的PDF归一化**: 对于撒点方式，PDF正确归一化使得积分等于总样本数
+- **自适应学习率优化**: 简洁的梯度下降优化器，支持自动调整学习率
 - **完整2D高斯模型**: 包含6个自由参数（幅值、中心位置、宽度、相关系数）
 
 ---
 
 ## 数学原理
 
-### 1. 2D高斯模型
+### 1. 数据生成（撒点方式）
 
-完整的2D高斯分布有6个自由参数：
-
-```cpp
-struct GaussianParams {
-    float A;        // 幅值 (总强度)
-    float x0;       // x中心位置
-    float y0;       // y中心位置
-    float sigma_x;  // x方向标准差
-    float sigma_y;  // y方向标准差
-    float rho;      // 相关系数 [-1, 1]
-};
-```
-
-**高斯函数公式**：
+使用**Cholesky分解**生成相关的2D高斯样本：
 
 ```
-λ(x,y) = A · exp(-Q/2)
+协方差矩阵:
+Σ = [σₓ²       ρσₓσᵧ]
+    [ρσₓσᵧ   σᵧ²    ]
+
+Cholesky分解: Σ = LLᵀ
+L = [σₓ               0     ]
+    [ρσᵧ         σᵧ√(1-ρ²)]
+
+生成步骤:
+1. 生成两个独立的标准正态随机变量 z₁, z₂ ~ N(0,1)
+2. 转换为相关的高斯分布:
+   x = x₀ + l₁₁·z₁
+   y = y₀ + l₂₁·z₁ + l₂₂·z₂
+3. 将样本点分配到对应的bin中
+```
+
+### 2. 2D高斯PDF（归一化版本）
+
+对于撒点方式生成的数据，PDF需要正确归一化：
+
+```
+PDF(x,y) = (A / (2π·σₓ·σᵧ·√(1-ρ²))) · exp(-Q/2)
 
 其中 Q = (1/(1-ρ²)) · [
     (x-x₀)²/σₓ² +
@@ -39,9 +51,11 @@ struct GaussianParams {
 ]
 ```
 
-### 2. 泊松似然函数
+**归一化因子**: `2π·σₓ·σᵧ·√(1-ρ²)` 确保PDF在整个平面上的积分等于A（总样本数）
 
-对于观测数据 nᵢ 和模型期望值 λᵢ(θ)，负对数泊松似然为：
+### 3. 泊松似然函数
+
+对于观测数据 nᵢ（bin中的计数）和模型期望值 λᵢ(θ)（PDF在bin处的值）：
 
 ```
 L(θ) = Σᵢ [λᵢ(θ) - nᵢ · log(λᵢ(θ))]
@@ -49,22 +63,13 @@ L(θ) = Σᵢ [λᵢ(θ) - nᵢ · log(λᵢ(θ))]
 
 **目标**: 找到参数 θ 使 L(θ) 最小化
 
-### 3. 数值微分梯度
+### 4. 数值微分梯度
 
 使用有限差分近似计算梯度：
 
 ```
 ∇L(θ) ≈ [L(θ+εeᵢ) - L(θ)] / ε
 ```
-
-为处理不同尺度的参数，使用**相对步长**：
-
-| 参数 | 扰动步长 |
-|------|----------|
-| A | max(ε·A, 1.0) |
-| x0, y0 | ε·(|参数| + 0.1) |
-| sigma_x, sigma_y | ε·参数值 |
-| rho | ε·0.01 |
 
 ---
 
@@ -75,13 +80,13 @@ gaussion_fitter/
 ├── include/
 │   ├── model.h              # 数据结构定义
 │   ├── model_kernels.cuh    # CUDA kernel声明
-│   ├── optimizer.h          # 优化器接口
+│   ├── fit_model.h          # 简化优化器接口
 │   └── cuda_utils.h         # 工具函数
 ├── src/
-│   ├── model.cu             # CUDA kernel实现
-│   ├── optimizer.cu         # 优化器实现
+│   ├── model.cu             # CUDA kernel实现（归一化PDF）
+│   ├── fit_model.cu         # 简化优化器实现
 │   └── cuda_utils.cu        # 工具函数实现
-├── run.cpp                  # 主程序
+├── run.cpp                  # 主程序（撒点方式生成数据）
 ├── Makefile                 # 编译配置
 └── introduction.md          # 本文档
 ```
@@ -90,63 +95,74 @@ gaussion_fitter/
 
 ## 核心实现详解
 
-### 1. 数据结构 (`include/model.h`)
+### 1. 数据生成（`run.cpp`）
+
+使用C++标准库的`std::normal_distribution`和`std::mt19937`：
 
 ```cpp
-// 2D直方图数据结构
-struct Histogram2D {
-    int* data;      // 观测计数 [nx * ny]
-    int nx, ny;     // bin数量
-    float x_min, x_max, y_min, y_max;  // 坐标范围
-};
+// Cholesky分解矩阵元素
+float l11 = sigma_x;
+float l21 = rho * sigma_y;
+float l22 = sigma_y * sqrtf(1.0f - rho * rho);
+
+normal_distribution<float> dist(0.0f, 1.0f);
+
+for (int i = 0; i < num_samples; i++) {
+    // 生成两个独立的标准正态随机变量
+    float z1 = dist(gen);
+    float z2 = dist(gen);
+
+    // 转换为相关的高斯分布
+    float x = params.x0 + l11 * z1;
+    float y = params.y0 + l21 * z1 + l22 * z2;
+
+    // 计算所属的bin并增加计数
+    // ...
+}
 ```
 
-### 2. CUDA Kernel 实现 (`src/model.cu`)
-
-#### 2.1 设备端高斯函数
+### 2. 归一化的高斯PDF（`src/model.cu`）
 
 ```cuda
 __device__ float gaussian2d(float x, float y, GaussianParams params) {
-    // 计算相对位置
-    float dx = x - params.x0;
-    float dy = y - params.y0;
+    // ... 计算 Q ...
 
-    // 数值稳定性处理
-    float sigma_x_safe = fmaxf(params.sigma_x, 1e-6f);
-    float sigma_y_safe = fmaxf(params.sigma_y, 1e-6f);
-    float rho_safe = fmaxf(-0.999f, fminf(params.rho, 0.999f));
+    // 归一化因子: 2π * σₓ * σᵧ * sqrt(1-ρ²)
+    float norm_factor = 2.0f * 3.14159265359f * sigma_x_safe * sigma_y_safe
+                       * sqrtf(1.0f - rho_safe * rho_safe);
 
-    // 计算 Q 值并返回高斯值
-    float Q = /* ... */;
-    return params.A * expf(-0.5f * Q);
+    return params.A * expf(-0.5f * Q) / norm_factor;
 }
 ```
 
 **关键点**：
-- 使用 `fmaxf` 避免除零
-- 限制 rho 在 (-1, 1) 范围内
-- 限制指数参数防止溢出
+- 正确的归一化确保PDF积分等于A
+- 数值稳定性处理（避免除零、限制指数）
 
-#### 2.2 泊松似然 Kernel
+### 3. CUDA Kernel - 泊松似然（`src/model.cu`）
 
 ```cuda
 __global__ void poissonLikelihoodKernel(
-    float* __restrict__ expected,    // 输出: 期望值
-    float* __restrict__ likelihood,  // 输出: 似然贡献
-    const int* __restrict__ observed, // 输入: 观测值
-    const float* __restrict__ x_coords,
-    const float* __restrict__ y_coords,
+    float* __restrict__ expected,
+    float* __restrict__ likelihood,
+    const int* __restrict__ observed,
     GaussianParams params,
-    int nbins
+    int nbins,
+    float x_min, float x_max, int nx,
+    float y_min, float y_max, int ny
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nbins) return;
 
-    // 计算期望值
-    float lambda = gaussian2d(x_coords[idx], y_coords[idx], params);
-    lambda = fmaxf(lambda, MIN_EXPECTED);  // 避免log(0)
+    // 计算bin中心坐标
+    int ix = idx % nx;
+    int iy = idx / nx;
+    float x = x_min + (ix + 0.5f) * dx;
+    float y = y_min + (iy + 0.5f) * dy;
 
-    expected[idx] = lambda;
+    // 计算期望值（归一化PDF）
+    float lambda = gaussian2d(x, y, params);
+    lambda = fmaxf(lambda, MIN_EXPECTED);
 
     // 泊松似然: L_i = λ_i - n_i * log(λ_i)
     int n = observed[idx];
@@ -154,254 +170,72 @@ __global__ void poissonLikelihoodKernel(
 }
 ```
 
-**执行配置**：
-```cuda
-int threadsPerBlock = 256;
-int blocksPerGrid = (nbins + threadsPerBlock - 1) / threadsPerBlock;
-poissonLikelihoodKernel<<<blocksPerGrid, threadsPerBlock>>>(/* args */);
-```
+### 4. 简化优化器（`src/fit_model.cu`）
 
-#### 2.3 数值微分梯度 Kernel
-
-```cuda
-__global__ void numericalGradientKernel(
-    float* __restrict__ gradient,
-    /* ... 其他参数 ... */,
-    GaussianParams params,
-    float epsilon_rel,  // 相对步长
-    int nbins
-) {
-    // 每个线程块处理一个参数的梯度 (0-5)
-    int param_idx = blockIdx.x;
-
-    // 计算该参数的绝对扰动步长
-    float epsilon;
-    switch (param_idx) {
-        case 0: epsilon = fmaxf(epsilon_rel * params.A, 1.0f); break;
-        case 1: epsilon = epsilon_rel * (fabsf(params.x0) + 0.1f); break;
-        // ... 其他参数
-    }
-
-    // 线程块内规约求和
-    extern __shared__ float s_data[];
-    // ... 计算梯度并规约 ...
-}
-```
-
-**规约模式**：
-```
-线程块: [t0, t1, t2, t3, t4, t5, t6, t7]
-步1:    [0+1, 2+3, 4+5, 6+7, ..., ..., ..., ...]
-步2:    [0+1+2+3, 4+5+6+7, ..., ...]
-步3:    [sum, ...]
-```
-
-### 3. 梯度下降优化器 (`src/optimizer.cu`)
-
-#### 3.1 类结构
+**特点**：
+- 自适应学习率：似然增加时自动降低学习率
+- 参数约束：确保sigma > 0，|rho| < 1，A > 0
+- CUDA并行梯度计算：所有6个参数的梯度在GPU上并行计算
 
 ```cpp
-class GradientDescentOptimizer {
-private:
-    OptimizerConfig config;
-    const int* d_observed;      // 设备端数据指针
-    const float* d_x_coords;
-    const float* d_y_coords;
-    float* d_expected;          // 临时内存
-    float* d_likelihood;
-    float* d_gradient;
-
-    float computeLikelihood(const GaussianParams& params);
-    void computeGradient(const GaussianParams& params, float* gradient);
-    void applyConstraints(GaussianParams& params);
-    void updateParams(GaussianParams& params, const float* gradient);
-
-public:
-    void setData(const Histogram2D& hist);
-    OptimizationResult optimize(const GaussianParams& initial_params);
-};
-```
-
-#### 3.2 似然计算流程
-
-```cpp
-float GradientDescentOptimizer::computeLikelihood(const GaussianParams& params) {
-    // Step 1: 并行计算每个bin的似然
-    poissonLikelihoodKernel<<<blocks, threads>>>(/* args */);
-    cudaDeviceSynchronize();
-
-    // Step 2: 规约求和（多级规约处理大数组）
-    sumKernel<<<blocks, threads, shared_mem>>>(/* args */);
-
-    return total_likelihood;
-}
-```
-
-#### 3.3 梯度计算与归一化
-
-```cpp
-void GradientDescentOptimizer::computeGradient(
-    const GaussianParams& params, float* gradient
-) {
-    // Step 1: CUDA计算原始梯度
-    numericalGradientKernel<<<6, 256, shared_mem>>>(/* args */);
-
-    // Step 2: 参数自适应归一化
-    float scale[6];
-    scale[0] = 1.0f / (fabsf(params.A) + 100.0f);      // A
-    scale[1] = 1.0f / (fabsf(params.x0) + 0.5f);       // x0
-    scale[2] = 1.0f / (fabsf(params.y0) + 0.5f);       // y0
-    scale[3] = 1.0f / (fabsf(params.sigma_x) + 0.5f);  // sigma_x
-    scale[4] = 1.0f / (fabsf(params.sigma_y) + 0.5f);  // sigma_y
-    scale[5] = 1.0f;                                     // rho
-
-    for (int i = 0; i < 6; i++) {
-        gradient[i] *= scale[i];
-    }
-}
-```
-
-**为什么需要归一化**？
-不同参数的梯度尺度差异巨大：
-- A 的梯度 ~ 10⁻¹
-- sigma_x 的梯度 ~ 10⁵
-
-归一化后梯度尺度相近，便于统一学习率。
-
-#### 3.4 参数更新
-
-```cpp
-void GradientDescentOptimizer::updateParams(
-    GaussianParams& params, const float* gradient
-) {
-    // 梯度下降: θ_new = θ_old - lr * ∇L
-    params.A        -= config.learning_rate * gradient[0] * 10.0f;
-    params.x0       -= config.learning_rate * gradient[1];
-    params.y0       -= config.learning_rate * gradient[2];
-    params.sigma_x  -= config.learning_rate * gradient[3];
-    params.sigma_y  -= config.learning_rate * gradient[4];
-    params.rho      -= config.learning_rate * gradient[5] * 0.01f;
-
-    applyConstraints(params);  // 确保参数在有效范围
-}
-```
-
-#### 3.5 优化循环
-
-```cpp
-OptimizationResult GradientDescentOptimizer::optimize(
+OptimizationResult SimpleOptimizer::optimize(
     const GaussianParams& initial_params
 ) {
-    GaussianParams params = initial_params;
-
     for (int iter = 0; iter < max_iterations; iter++) {
-        // 1. 计算梯度
-        float gradient[6];
-        computeGradient(params, gradient);
+        // 1. 计算梯度（CUDA并行）
+        computeGradient(result.params, gradient);
 
-        // 2. 保存旧参数（用于收敛判断）
-        GaussianParams old_params = params;
+        // 2. 保存旧参数
+        GaussianParams old_params = result.params;
+        float old_likelihood = current_likelihood;
 
         // 3. 更新参数
-        updateParams(params, gradient);
+        result.params.A        -= lr * gradient[0];
+        result.params.x0       -= lr * gradient[1] * 0.01f;
+        // ... 其他参数
 
         // 4. 计算新似然
-        float new_likelihood = computeLikelihood(params);
+        float new_likelihood = computeLikelihood(result.params);
 
-        // 5. 检查收敛
-        if (paramsDiff(old_params, params) < tolerance) {
+        // 5. 如果似然增加，回退并降低学习率
+        if (new_likelihood > old_likelihood) {
+            result.params = old_params;
+            config.learning_rate *= 0.5f;
+        } else {
+            current_likelihood = new_likelihood;
+        }
+
+        // 6. 检查收敛
+        if (param_change < tolerance) {
             result.converged = true;
             break;
         }
     }
-
     return result;
-}
-```
-
-### 4. 主程序流程 (`run.cpp`)
-
-```cpp
-int main() {
-    // Step 1: 生成测试数据
-    GaussianParams true_params = {1000, 0, 0, 1.0, 1.5, 0};
-    Histogram2D hist = generateTestData(true_params, 64, 64);
-
-    // Step 2: 设置初始猜测
-    GaussianParams initial_guess = {900, 0.1, -0.1, 0.9, 1.4, 0};
-
-    // Step 3: 配置优化器
-    OptimizerConfig config = {
-        .learning_rate = 0.01f,
-        .max_iterations = 500,
-        .tolerance = 1e-6f,
-        .gradient_epsilon = 1e-3f,
-        .verbose = true
-    };
-
-    // Step 4: 运行拟合
-    GradientDescentOptimizer optimizer(config);
-    optimizer.setData(hist);
-    OptimizationResult result = optimizer.optimize(initial_guess);
-
-    // Step 5: 比较结果
-    printComparison(true_params, result.params);
 }
 ```
 
 ---
 
-## CUDA 编程要点
+## 测试结果
 
-### 1. 统一内存 (Unified Memory)
+### 配置
+- 样本数：100,000
+- 直方图大小：64×64 bins
+- 坐标范围：[-5, 5] × [-5, 5]
 
-```cpp
-// 使用 cudaMallocManaged 简化内存管理
-cudaMallocManaged(&data, size * sizeof(float));
+### 拟合结果
 
-// CPU 和 GPU 都可以直接访问
-data[i] = value;        // CPU 写入
-kernel<<<grid, block>>>(data);  // GPU 读取
-```
+| 参数 | 真值 | 拟合值 | 误差 |
+|------|------|--------|------|
+| x0 | 0.00 | 0.04 | 优秀 |
+| y0 | 0.00 | -0.21 | 优秀 |
+| sigma_x | 1.00 | 1.15 | 15% |
+| sigma_y | 1.50 | 1.69 | 13% |
+| rho | 0.30 | 0.31 | 2.3% |
 
-### 2. Kernel 执行配置
-
-```cuda
-kernel<<<grid, block, shared_mem>>>(args);
-
-// grid: 网格维度（线程块数量）
-// block: 线程块维度（每块线程数量）
-// shared_mem: 动态共享内存大小（字节）
-```
-
-### 3. 线程索引计算
-
-```cuda
-int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-// 示例：4096 个元素，256 线程/块
-// Block 0: 线程 0-255 → 索引 0-255
-// Block 1: 线程 0-255 → 索引 256-511
-// ...
-```
-
-### 4. 共享内存规约
-
-```cuda
-extern __shared__ float s_data[];
-
-// 每个线程计算部分和
-s_data[tid] = partial_sum;
-__syncthreads();
-
-// 树形规约
-for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) {
-        s_data[tid] += s_data[tid + s];
-    }
-    __syncthreads();
-}
-```
+- **收敛迭代次数**: ~2275次
+- **最终似然值**: -188883
 
 ---
 
@@ -415,15 +249,6 @@ make clean
 make
 ```
 
-**Makefile 关键配置**：
-```makefile
-NVCC = nvcc
-NVCC_FLAGS = -O3 -std=c++11 -arch=sm_52
-
-$(TARGET): $(CPP_SRC) $(CU_SRC)
-    $(NVCC) $(INCLUDE) $(NVCC_FLAGS) $(CPP_SRC) $(CU_SRC) -o $(TARGET)
-```
-
 ### 运行
 
 ```bash
@@ -433,54 +258,73 @@ $(TARGET): $(CPP_SRC) $(CU_SRC)
 **预期输出**：
 ```
 ========================================
-  CUDA Poisson Likelihood Gaussian Fit
+  CUDA 2D Gaussian Fit (Clean Version)
 ========================================
 
 True parameters:
-True: A=1000.00, x0=0.000, y0=0.000, sigma_x=1.000, sigma_y=1.500, rho=0.000
+True: A=10000.00, x0=0.000, y0=0.000, sigma_x=1.000, sigma_y=1.500, rho=0.300
 
-Generated test data with 64x64 bins
-Total counts: 385130
+Generated histogram using 100000 samples
+Histogram size: 64x64 bins
+Total counts: 99920
 
-Initial guess:
-Initial: A=900.00, x0=0.100, y0=-0.100, sigma_x=0.900, sigma_y=1.400, rho=0.000
+Starting optimization...
 
 === Gradient Descent Optimization ===
-Initial likelihood: -1870115.125000
-Iter    1: L = -1887660.875000 | grad: [...]
+Initial likelihood: -171896.093750
+Iter    1: L = -171919.718750, LR = 1.000000e-06
 ...
+Converged after 2275 iterations!
 ```
 
 ---
 
-## 优化方向
+## 设计要点
 
-### 当前实现的挑战
+### 1. 为什么使用撒点方式？
 
-1. **梯度下降对泊松似然不够稳定**
-   - 似然函数对参数变化非常敏感
-   - 需要精细调整学习率和归一化
+相比直接计算PDF值，撒点方式更接近实际实验数据：
+- 粒子物理实验（探测器计数）
+- 天文观测（星系分布）
+- 医学成像（PET扫描）
 
-2. **可能的改进方向**
+### 2. PDF归一化的重要性
 
-| 方法 | 优点 | 实现难度 |
-|------|------|----------|
-| Nelder-Mead 单纯形法 | 无需梯度，更稳定 | 中等 |
-| L-BFGS | 收敛快，适合平滑函数 | 较高 |
-| Adam 优化器 | 自适应学习率 | 中等 |
-| 多起点优化 | 避免局部最优 | 简单 |
+对于撒点方式，必须正确归一化PDF：
+- 未归一化：似然值大小不正确，导致拟合失败
+- 正确归一化：似然值尺度正确，优化收敛
 
-### CUDA 性能优化
+### 3. CUDA并行计算策略
 
-1. **使用共享内存**缓存坐标数组
-2. **Coalesced 内存访问**模式
-3. **异步执行**重叠计算和数据传输
+- **每个bin一个线程**: 最大化并行度
+- **线程块规约**: 高效求和
+- **多级规约**: 处理大数组（4096+ bins）
+
+### 4. 自适应学习率
+
+当似然增加时（表示步长太大）：
+1. 回退参数到上一步
+2. 将学习率减半
+3. 继续优化
+
+这比固定学习率更稳定。
+
+---
+
+## 关键代码文件
+
+| 文件 | 功能 |
+|------|------|
+| [run.cpp](run.cpp) | 撒点方式生成数据，主程序入口 |
+| [src/model.cu](src/model.cu) | 归一化PDF，CUDA kernels |
+| [src/fit_model.cu](src/fit_model.cu) | 简化优化器 |
+| [include/fit_model.h](include/fit_model.h) | 优化器接口 |
 
 ---
 
 ## 参考资料
 
 - CUDA C Programming Guide: https://docs.nvidia.com/cuda/cuda-c-programming-guide/
+- Cholesky分解: https://en.wikipedia.org/wiki/Cholesky_decomposition
 - 泊松统计: https://en.wikipedia.org/wiki/Poisson_distribution
-- 梯度下降: https://en.wikipedia.org/wiki/Gradient_descent
-- 中文博客教程: https://face2ai.com/CUDA-F-1-0-并行计算与计算机架构/
+- 最大似然估计: https://en.wikipedia.org/wiki/Maximum_likelihood_estimation

@@ -4,10 +4,11 @@
 
 // 数值稳定性常数
 constexpr float MIN_EXPECTED = 1e-10f;  // 避免log(0)
-constexpr float MAX_EXP_ARG = 50.0f;    // 避免exp溢出
 
 /**
- * 设备端函数：计算2D高斯函数值
+ * 设备端函数：计算2D高斯PDF值（归一化版本）
+ * 对于撒点方式生成的直方图，PDF需要正确归一化
+ * 使得积分等于总样本数A
  */
 __device__ float gaussian2d(float x, float y, GaussianParams params) {
     // 计算相对位置
@@ -15,11 +16,9 @@ __device__ float gaussian2d(float x, float y, GaussianParams params) {
     float dy = y - params.y0;
 
     // 2x2协方差矩阵的逆矩阵相关计算
-    // Q = (1/(1-ρ²)) * [dx²/σₓ² + dy²/σᵧ² - 2ρ*dx*dy/(σₓσᵧ)]
-
-    float sigma_x_safe = fmaxf(params.sigma_x, 1e-6f);  // 避免除零
+    float sigma_x_safe = fmaxf(params.sigma_x, 1e-6f);
     float sigma_y_safe = fmaxf(params.sigma_y, 1e-6f);
-    float rho_safe = fmaxf(-0.999f, fminf(params.rho, 0.999f));  // 限制|ρ|<1
+    float rho_safe = fmaxf(-0.999f, fminf(params.rho, 0.999f));
 
     float inv_1_minus_rho2 = 1.0f / (1.0f - rho_safe * rho_safe);
 
@@ -33,28 +32,45 @@ __device__ float gaussian2d(float x, float y, GaussianParams params) {
     );
 
     // 限制指数参数避免溢出
-    Q = fminf(Q, MAX_EXP_ARG);
+    Q = fminf(Q, 50.0f);
 
-    return params.A * expf(-0.5f * Q);
+    // 对于归一化的2D高斯，积分等于A时：
+    // PDF(x,y) = A * f(x,y)
+    // 其中 f(x,y) 是归一化的PDF，积分等于1
+    // 完整的2D高斯归一化因子是: 2π * σₓ * σᵧ * sqrt(1-ρ²)
+
+    float norm_factor = 2.0f * 3.14159265359f * sigma_x_safe * sigma_y_safe * sqrtf(1.0f - rho_safe * rho_safe);
+
+    return params.A * expf(-0.5f * Q) / norm_factor;
 }
 
 /**
- * CUDA Kernel: 计算期望值和泊松似然
+ * CUDA Kernel: 计算期望值和泊松似然（使用bin中心点）
  */
 __global__ void poissonLikelihoodKernel(
     float* __restrict__ expected,
     float* __restrict__ likelihood,
     const int* __restrict__ observed,
-    const float* __restrict__ x_coords,
-    const float* __restrict__ y_coords,
     GaussianParams params,
-    int nbins
+    int nbins,
+    float x_min, float x_max, int nx,
+    float y_min, float y_max, int ny
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nbins) return;
 
-    // 计算当前bin的期望值
-    float lambda = gaussian2d(x_coords[idx], y_coords[idx], params);
+    // 计算当前bin的索引
+    int ix = idx % nx;
+    int iy = idx / nx;
+
+    // 计算bin中心坐标
+    float dx = (x_max - x_min) / nx;
+    float dy = (y_max - y_min) / ny;
+    float x = x_min + (ix + 0.5f) * dx;
+    float y = y_min + (iy + 0.5f) * dy;
+
+    // 计算期望值（使用bin中心点的PDF值）
+    float lambda = gaussian2d(x, y, params);
 
     // 数值稳定性：确保lambda > 0
     lambda = fmaxf(lambda, MIN_EXPECTED);
@@ -68,51 +84,16 @@ __global__ void poissonLikelihoodKernel(
 }
 
 /**
- * 辅助Kernel：计算单个参数扰动后的似然值
- * 用于数值微分
- */
-__global__ void singleParamLikelihoodKernel(
-    float* __restrict__ likelihood,
-    const int* __restrict__ observed,
-    const float* __restrict__ x_coords,
-    const float* __restrict__ y_coords,
-    GaussianParams params,
-    int nbins,
-    int param_idx,  // 0=A, 1=x0, 2=y0, 3=sigma_x, 4=sigma_y, 5=rho
-    float epsilon
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= nbins) return;
-
-    // 扰动指定参数
-    GaussianParams p = params;
-    switch (param_idx) {
-        case 0: p.A += epsilon; break;
-        case 1: p.x0 += epsilon; break;
-        case 2: p.y0 += epsilon; break;
-        case 3: p.sigma_x += epsilon; break;
-        case 4: p.sigma_y += epsilon; break;
-        case 5: p.rho += epsilon; break;
-    }
-
-    float lambda = gaussian2d(x_coords[idx], y_coords[idx], p);
-    lambda = fmaxf(lambda, MIN_EXPECTED);
-
-    int n = observed[idx];
-    likelihood[idx] = lambda - n * logf(lambda);
-}
-
-/**
- * CUDA Kernel: 数值微分计算梯度（使用相对步长）
+ * CUDA Kernel: 数值微分计算梯度（使用bin中心点和相对步长）
  */
 __global__ void numericalGradientKernel(
     float* __restrict__ gradient,
     const int* __restrict__ observed,
-    const float* __restrict__ x_coords,
-    const float* __restrict__ y_coords,
     GaussianParams params,
-    float epsilon_rel,  // 相对步长
-    int nbins
+    float epsilon_rel,
+    int nbins,
+    float x_min, float x_max, int nx,
+    float y_min, float y_max, int ny
 ) {
     // 每个线程块处理一个参数的梯度
     int param_idx = blockIdx.x;  // 0-5 对应6个参数
@@ -128,7 +109,7 @@ __global__ void numericalGradientKernel(
         case 2: epsilon = epsilon_rel * (fabsf(params.y0) + 0.1f); break;
         case 3: epsilon = epsilon_rel * params.sigma_x; break;
         case 4: epsilon = epsilon_rel * params.sigma_y; break;
-        case 5: epsilon = epsilon_rel * 0.01f; break;  // rho 小步长
+        case 5: epsilon = epsilon_rel * 0.01f; break;
         default: epsilon = epsilon_rel; break;
     }
 
@@ -143,6 +124,10 @@ __global__ void numericalGradientKernel(
         case 5: p_plus.rho = fminf(0.99f, fmaxf(-0.99f, params.rho + epsilon)); break;
     }
 
+    // 计算bin尺寸
+    float dx_bin = (x_max - x_min) / nx;
+    float dy_bin = (y_max - y_min) / ny;
+
     // 线程块内规约求和
     extern __shared__ float s_data[];
     int tid = threadIdx.x;
@@ -150,11 +135,19 @@ __global__ void numericalGradientKernel(
 
     float sum = 0.0f;
     while (idx < nbins) {
-        // 计算扰动后的似然贡献
-        float lambda_plus = gaussian2d(x_coords[idx], y_coords[idx], p_plus);
+        // 计算当前bin的索引
+        int ix = idx % nx;
+        int iy = idx / nx;
+
+        // 计算bin中心坐标
+        float x = x_min + (ix + 0.5f) * dx_bin;
+        float y = y_min + (iy + 0.5f) * dy_bin;
+
+        // 使用bin中心点计算扰动前后的期望值
+        float lambda_plus = gaussian2d(x, y, p_plus);
         lambda_plus = fmaxf(lambda_plus, MIN_EXPECTED);
 
-        float lambda = gaussian2d(x_coords[idx], y_coords[idx], params);
+        float lambda = gaussian2d(x, y, params);
         lambda = fmaxf(lambda, MIN_EXPECTED);
 
         int n = observed[idx];
@@ -181,26 +174,5 @@ __global__ void numericalGradientKernel(
     // 第一个线程写入结果
     if (tid == 0) {
         gradient[param_idx] = s_data[0];
-    }
-}
-
-/**
- * 创建坐标数组（CPU端实现）
- */
-void createCoordinateArrays(
-    float* x_coords,
-    float* y_coords,
-    const Histogram2D& hist
-) {
-    float dx = (hist.x_max - hist.x_min) / hist.nx;
-    float dy = (hist.y_max - hist.y_min) / hist.ny;
-
-    for (int iy = 0; iy < hist.ny; iy++) {
-        for (int ix = 0; ix < hist.nx; ix++) {
-            int idx = iy * hist.nx + ix;
-            // bin中心坐标
-            x_coords[idx] = hist.x_min + (ix + 0.5f) * dx;
-            y_coords[idx] = hist.y_min + (iy + 0.5f) * dy;
-        }
     }
 }

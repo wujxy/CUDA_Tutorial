@@ -5,7 +5,7 @@ TARGET = gaussion_fitter
 
 # 源文件
 CPP_SRC = run.cpp
-CU_SRC = src/model.cu src/optimizer.cu src/cuda_utils.cu
+CU_SRC = src/model.cu src/fit_model.cu src/config.cpp src/cuda_utils.cu
 
 # 包含目录
 INCLUDE = -Iinclude

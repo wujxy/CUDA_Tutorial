@@ -1,125 +1,90 @@
 #include <iostream>
-#include <random>
 #include <cmath>
 #include <iomanip>
+#include <random>
+#include <vector>
+#include <algorithm>
 
 #include "include/model.h"
-#include "include/optimizer.h"
+#include "include/fit_model.h"
+#include "include/config.h"
 #include "include/cuda_utils.h"
 
 using namespace std;
 
 /**
- * 生成泊松随机数
+ * 使用撒点方式生成2D高斯直方图
+ * 生成多组(x, y)样本点，然后填充到直方图bins中
  */
-int poissonRandom(float lambda, mt19937& gen) {
-    if (lambda < 10.0f) {
-        // Knuth算法（适合小lambda）
-        float L = expf(-lambda);
-        int k = 0;
-        float p = 1.0f;
-        do {
-            k++;
-            uniform_real_distribution<float> dist(0.0f, 1.0f);
-            p *= dist(gen);
-        } while (p > L);
-        return k - 1;
-    } else {
-        // 正态近似（适合大lambda）
-        normal_distribution<float> norm(0.0f, 1.0f);
-        return static_cast<int>(lambda + sqrtf(lambda) * norm(gen));
-    }
-}
-
-/**
- * Step 1: 生成2D高斯分布测试数据
- * 使用已知参数生成理想高斯分布，然后添加泊松噪声
- */
-Histogram2D generateTestData(const GaussianParams& true_params, int nx, int ny) {
+Histogram2D generateGaussianHistogram(const GaussianParams& params, int nx, int ny,
+                                   float x_min, float x_max, float y_min, float y_max,
+                                   int num_samples) {
     Histogram2D hist;
     hist.nx = nx;
     hist.ny = ny;
-    hist.x_min = -5.0f;
-    hist.x_max = 5.0f;
-    hist.y_min = -5.0f;
-    hist.y_max = 5.0f;
+    hist.x_min = x_min;
+    hist.x_max = x_max;
+    hist.y_min = y_min;
+    hist.y_max = y_max;
 
     int nbins = nx * ny;
     CUDA_CHECK(cudaMallocManaged(&hist.data, nbins * sizeof(int)));
 
-    // 生成坐标
-    float* x_coords;
-    float* y_coords;
-    CUDA_CHECK(cudaMallocManaged(&x_coords, nbins * sizeof(float)));
-    CUDA_CHECK(cudaMallocManaged(&y_coords, nbins * sizeof(float)));
-    createCoordinateArrays(x_coords, y_coords, hist);
+    // 初始化直方图为0
+    for (int i = 0; i < nbins; i++) {
+        hist.data[i] = 0;
+    }
 
-    // 随机数生成器
+    // 使用C++标准库生成高斯分布样本
     random_device rd;
     mt19937 gen(rd());
 
-    // 计算理想高斯值并添加泊松噪声
-    // 使用与模型相同的2D高斯函数（包含rho项）
-    float sum_counts = 0.0f;
-    for (int i = 0; i < nbins; i++) {
-        // 使用完整的2D高斯公式（与CUDA kernel一致）
-        float dx = x_coords[i] - true_params.x0;
-        float dy = y_coords[i] - true_params.y0;
+    // 生成2D高斯样本（Cholesky分解）
+    float sigma_x = params.sigma_x;
+    float sigma_y = params.sigma_y;
+    float rho = params.rho;
 
-        float sigma_x = true_params.sigma_x;
-        float sigma_y = true_params.sigma_y;
-        float rho = true_params.rho;
+    float l11 = sigma_x;
+    float l21 = rho * sigma_y;
+    float l22 = sigma_y * sqrtf(1.0f - rho * rho);
 
-        float inv_1_minus_rho2 = 1.0f / (1.0f - rho * rho);
-        float dx_sigma = dx / sigma_x;
-        float dy_sigma = dy / sigma_y;
+    normal_distribution<float> dist(0.0f, 1.0f);
 
-        float Q = inv_1_minus_rho2 * (
-            dx_sigma * dx_sigma +
-            dy_sigma * dy_sigma -
-            2.0f * rho * dx_sigma * dy_sigma
-        );
+    for (int i = 0; i < num_samples; i++) {
+        float z1 = dist(gen);
+        float z2 = dist(gen);
 
-        float lambda = true_params.A * expf(-0.5f * Q);
-        lambda = fmaxf(lambda, 0.0f);  // 确保非负
+        float x = params.x0 + l11 * z1;
+        float y = params.y0 + l21 * z1 + l22 * z2;
 
-        // 添加泊松噪声
-        hist.data[i] = poissonRandom(lambda, gen);
-        sum_counts += hist.data[i];
+        // 计算所属的bin
+        if (x >= hist.x_min && x < hist.x_max &&
+            y >= hist.y_min && y < hist.y_max) {
+
+            float dx = (hist.x_max - hist.x_min) / nx;
+            float dy = (hist.y_max - hist.y_min) / ny;
+
+            int ix = static_cast<int>((x - hist.x_min) / dx);
+            int iy = static_cast<int>((y - hist.y_min) / dy);
+
+            if (ix >= 0 && ix < nx && iy >= 0 && iy < ny) {
+                int idx = iy * nx + ix;
+                hist.data[idx]++;
+            }
+        }
     }
 
-    cout << "Generated test data with " << nx << "x" << ny << " bins" << endl;
-    cout << "Total counts: " << static_cast<int>(sum_counts) << endl;
+    // 计算总counts
+    int total_counts = 0;
+    for (int i = 0; i < nbins; i++) {
+        total_counts += hist.data[i];
+    }
 
-    cudaFree(x_coords);
-    cudaFree(y_coords);
+    cout << "Generated histogram using " << num_samples << " samples" << endl;
+    cout << "Histogram size: " << nx << "x" << ny << " bins" << endl;
+    cout << "Total counts: " << total_counts << endl;
 
     return hist;
-}
-
-/**
- * Step 2: 创建泊松似然拟合器
- * （已在optimizer.cu中实现）
- */
-
-/**
- * Step 3: 执行拟合程序（bin-to-bin在CUDA上计算）
- */
-OptimizationResult runFitting(const Histogram2D& hist, const GaussianParams& initial_guess) {
-    // 配置优化器 - 调整后的参数
-    OptimizerConfig config;
-    config.learning_rate = 0.01f;      // 增加学习率（因为梯度已被归一化）
-    config.max_iterations = 500;       // 更多迭代
-    config.tolerance = 1e-6f;          // 严格收敛容差
-    config.gradient_epsilon = 1e-3f;   // 相对步长
-    config.verbose = true;             // 打印详细输出
-
-    // 创建优化器
-    GradientDescentOptimizer optimizer(config);
-    optimizer.setData(hist);
-
-    // 执行优化
-    return optimizer.optimize(initial_guess);
 }
 
 /**
@@ -152,47 +117,76 @@ void printComparison(const GaussianParams& true_params, const GaussianParams& fi
 }
 
 /**
+ * 打印使用帮助
+ */
+void printUsage(const char* program_name) {
+    cout << "Usage: " << program_name << " [config_file]" << endl;
+    cout << endl;
+    cout << "Arguments:" << endl;
+    cout << "  config_file  Path to configuration file (default: config_default.conf)" << endl;
+    cout << endl;
+    cout << "Example:" << endl;
+    cout << "  " << program_name << "                    # Use default config" << endl;
+    cout << "  " << program_name << " my_config.conf     # Use custom config" << endl;
+}
+
+/**
  * 主函数
  */
-int main() {
+int main(int argc, char* argv[]) {
     cout << "========================================" << endl;
-    cout << "  CUDA Poisson Likelihood Gaussian Fit" << endl;
+    cout << "  CUDA 2D Gaussian Fit" << endl;
     cout << "========================================" << endl;
 
-    // 定义真实参数 - 简化版本（rho=0）
-    GaussianParams true_params;
-    true_params.A = 1000.0f;
-    true_params.x0 = 0.0f;
-    true_params.y0 = 0.0f;
-    true_params.sigma_x = 1.0f;
-    true_params.sigma_y = 1.5f;
-    true_params.rho = 0.0f;  // 不相关
+    // 解析命令行参数
+    string config_file = "config_default.conf";
+    if (argc > 1) {
+        config_file = argv[1];
+    }
 
-    cout << "\nTrue parameters:" << endl;
-    printParams("True", true_params);
+    // 显示配置文件路径
+    cout << "\nConfig file: " << config_file << endl;
 
-    // Step 1: 生成测试数据
-    constexpr int NX = 64;
-    constexpr int NY = 64;
-    Histogram2D hist = generateTestData(true_params, NX, NY);
+    // 加载配置
+    Config config;
+    if (!config.loadFromFile(config_file)) {
+        cerr << "Failed to load config file, using default values." << endl;
+    }
 
-    // 初始猜测 - 接近真实值
-    GaussianParams initial_guess;
-    initial_guess.A = 900.0f;
-    initial_guess.x0 = 0.1f;
-    initial_guess.y0 = -0.1f;
-    initial_guess.sigma_x = 0.9f;
-    initial_guess.sigma_y = 1.4f;
-    initial_guess.rho = 0.0f;  // 固定为0
+    // 打印配置信息
+    config.print();
+
+    // 使用配置中的参数
+
+    // Step 1: 使用撒点方式生成测试数据
+    Histogram2D hist = generateGaussianHistogram(
+        config.true_params,
+        config.nx, config.ny,
+        config.x_min, config.x_max,
+        config.y_min, config.y_max,
+        config.num_samples
+    );
 
     cout << "\nInitial guess:" << endl;
-    printParams("Initial", initial_guess);
+    printParams("Initial", config.initial_guess);
 
-    // Step 2 & 3: 运行拟合（CUDA计算期望值和梯度）
-    OptimizationResult result = runFitting(hist, initial_guess);
+    // Step 2: 配置优化器
+    OptimizerConfig opt_config;
+    opt_config.learning_rate = config.learning_rate;
+    opt_config.max_iterations = config.max_iterations;
+    opt_config.tolerance = config.tolerance;
+    opt_config.gradient_epsilon = config.gradient_epsilon;
+    opt_config.verbose = config.verbose;
 
-    // 打印结果比较
-    printComparison(true_params, result.params);
+    // Step 3: 创建优化器并执行拟合
+    SimpleOptimizer optimizer(opt_config);
+    optimizer.setData(hist);
+
+    cout << "\nStarting optimization..." << endl;
+    OptimizationResult result = optimizer.optimize(config.initial_guess);
+
+    // Step 4: 打印结果比较
+    printComparison(config.true_params, result.params);
 
     // 清理
     cudaFree(hist.data);
