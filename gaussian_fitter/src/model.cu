@@ -5,6 +5,9 @@
 // 数值稳定性常数
 constexpr float MIN_EXPECTED = 1e-10f;  // 避免log(0)
 
+// Bin积分采样点数（每个维度，总采样点数为 sub_samples^2）
+constexpr int BIN_INTEGRATION_SUBSAMPLES = 8;  // 8x8 = 64个采样点
+
 /**
  * 设备端函数：计算2D高斯PDF值（归一化版本）
  * 对于撒点方式生成的直方图，PDF需要正确归一化
@@ -45,7 +48,43 @@ __device__ float gaussian2d(float x, float y, GaussianParams params) {
 }
 
 /**
- * CUDA Kernel: 计算期望值和泊松似然（使用bin中心点）
+ * 设备端函数：计算2D高斯PDF在单个bin范围内的数值积分
+ * 使用二维均匀采样进行近似积分
+ *
+ * @param x_bin_start bin的x起始边界
+ * @param x_bin_end bin的x结束边界
+ * @param y_bin_start bin的y起始边界
+ * @param y_bin_end bin的y结束边界
+ * @param params 高斯参数
+ * @return PDF在bin范围内的积分近似值
+ */
+__device__ float integrateGaussianOverBin(
+    float x_bin_start, float x_bin_end,
+    float y_bin_start, float y_bin_end,
+    GaussianParams params
+) {
+    float dx = (x_bin_end - x_bin_start) / BIN_INTEGRATION_SUBSAMPLES;
+    float dy = (y_bin_end - y_bin_start) / BIN_INTEGRATION_SUBSAMPLES;
+    float sum = 0.0f;
+
+    // 二维采样：计算每个采样点的PDF值
+    for (int i = 0; i < BIN_INTEGRATION_SUBSAMPLES; i++) {
+        for (int j = 0; j < BIN_INTEGRATION_SUBSAMPLES; j++) {
+            // 使用采样点中心
+            float x = x_bin_start + (i + 0.5f) * dx;
+            float y = y_bin_start + (j + 0.5f) * dy;
+            sum += gaussian2d(x, y, params);
+        }
+    }
+
+    // 积分近似 = 平均值 × bin面积
+    float bin_area = (x_bin_end - x_bin_start) * (y_bin_end - y_bin_start);
+    int total_samples = BIN_INTEGRATION_SUBSAMPLES * BIN_INTEGRATION_SUBSAMPLES;
+    return sum / total_samples * bin_area;
+}
+
+/**
+ * CUDA Kernel: 计算期望值和泊松似然（使用bin内数值积分）
  */
 __global__ void poissonLikelihoodKernel(
     float* __restrict__ expected,
@@ -63,14 +102,16 @@ __global__ void poissonLikelihoodKernel(
     int ix = idx % nx;
     int iy = idx / nx;
 
-    // 计算bin中心坐标
+    // 计算bin边界
     float dx = (x_max - x_min) / nx;
     float dy = (y_max - y_min) / ny;
-    float x = x_min + (ix + 0.5f) * dx;
-    float y = y_min + (iy + 0.5f) * dy;
+    float x_bin_start = x_min + ix * dx;
+    float x_bin_end = x_bin_start + dx;
+    float y_bin_start = y_min + iy * dy;
+    float y_bin_end = y_bin_start + dy;
 
-    // 计算期望值（使用bin中心点的PDF值）
-    float lambda = gaussian2d(x, y, params);
+    // 计算期望值（使用bin内PDF数值积分）
+    float lambda = integrateGaussianOverBin(x_bin_start, x_bin_end, y_bin_start, y_bin_end, params);
 
     // 数值稳定性：确保lambda > 0
     lambda = fmaxf(lambda, MIN_EXPECTED);
@@ -84,7 +125,7 @@ __global__ void poissonLikelihoodKernel(
 }
 
 /**
- * CUDA Kernel: 数值微分计算梯度（使用bin中心点和相对步长）
+ * CUDA Kernel: 数值微分计算梯度（使用bin内数值积分）
  */
 __global__ void numericalGradientKernel(
     float* __restrict__ gradient,
@@ -139,15 +180,17 @@ __global__ void numericalGradientKernel(
         int ix = idx % nx;
         int iy = idx / nx;
 
-        // 计算bin中心坐标
-        float x = x_min + (ix + 0.5f) * dx_bin;
-        float y = y_min + (iy + 0.5f) * dy_bin;
+        // 计算bin边界
+        float x_bin_start = x_min + ix * dx_bin;
+        float x_bin_end = x_bin_start + dx_bin;
+        float y_bin_start = y_min + iy * dy_bin;
+        float y_bin_end = y_bin_start + dy_bin;
 
-        // 使用bin中心点计算扰动前后的期望值
-        float lambda_plus = gaussian2d(x, y, p_plus);
+        // 使用bin内数值积分计算扰动前后的期望值
+        float lambda_plus = integrateGaussianOverBin(x_bin_start, x_bin_end, y_bin_start, y_bin_end, p_plus);
         lambda_plus = fmaxf(lambda_plus, MIN_EXPECTED);
 
-        float lambda = gaussian2d(x, y, params);
+        float lambda = integrateGaussianOverBin(x_bin_start, x_bin_end, y_bin_start, y_bin_end, params);
         lambda = fmaxf(lambda, MIN_EXPECTED);
 
         int n = observed[idx];

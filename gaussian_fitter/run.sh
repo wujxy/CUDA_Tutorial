@@ -7,7 +7,7 @@
 PYTHON_BIN="/home/yoru/py_venv/ml_env/bin/python"
 
 # 设置默认配置文件
-CONFIG_FILE="config_default.conf"
+CONFIG_FILE="config/config_default.conf"
 
 # 解析命令行参数
 while [[ $# -gt 0 ]]; do

@@ -44,6 +44,7 @@ float* fit_histogram_ctypes(
     float tolerance,
     float gradient_epsilon,
     int verbose,
+    int timing_save_interval,
     int* iterations_out, int* converged_out,
     float** iteration_times_out, int* num_times_out
 );

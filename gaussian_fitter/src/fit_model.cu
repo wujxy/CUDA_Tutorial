@@ -191,20 +191,27 @@ OptimizationResult SimpleOptimizer::optimize(const GaussianParams& initial_param
         float new_likelihood = computeLikelihood(result.params);
         result.iterations = iter + 1;
 
-        // 记录迭代时间
+        // 记录迭代时间（只在指定间隔保存）
         auto iter_end = std::chrono::high_resolution_clock::now();
         float iter_time_ms = std::chrono::duration<float, std::milli>(iter_end - iter_start).count();
-        result.iteration_times.push_back(iter_time_ms);
+
+        // 只在指定间隔保存时间（第一次总是保存，之后每timing_save_interval次保存一次）
+        if (iter == 0 || (iter + 1) % config.timing_save_interval == 0) {
+            result.iteration_times.push_back(iter_time_ms);
+        }
 
         // 检查是否跳过这次更新
         float likelihood_change = new_likelihood - old_likelihood;
         float relative_change = fabsf(likelihood_change) / (fabsf(old_likelihood) + 1e-10f);
         bool is_warmup = (iter < 100);  // 前100次迭代作为预热期
 
-        // 计算参数变化幅度
-        float param_change = fabsf(result.params.A - old_params.A) +
+        // 计算参数变化幅度（使用相对变化）
+        float param_change = fabsf(result.params.A - old_params.A) / (fabsf(old_params.A) + 1e-10f) +
                             fabsf(result.params.x0 - old_params.x0) +
-                            fabsf(result.params.y0 - old_params.y0);
+                            fabsf(result.params.y0 - old_params.y0) +
+                            fabsf(result.params.sigma_x - old_params.sigma_x) +
+                            fabsf(result.params.sigma_y - old_params.sigma_y) +
+                            fabsf(result.params.rho - old_params.rho);
 
         if (new_likelihood > old_likelihood && relative_change > 1e-8f && !is_warmup && param_change > 1e-8f) {
             // 似然显著增加且参数有实际变化，恢复旧参数
@@ -229,7 +236,7 @@ OptimizationResult SimpleOptimizer::optimize(const GaussianParams& initial_param
                        iter + 1, new_likelihood, config.learning_rate, iter_time_ms);
             }
 
-            // 检查收敛
+            // 检查收敛（使用相对变化）
             if (!is_warmup && iter >= 100) {
                 if (param_change < config.tolerance) {
                     result.converged = true;

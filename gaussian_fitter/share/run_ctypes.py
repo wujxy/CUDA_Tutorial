@@ -102,6 +102,7 @@ class GaussianFitterLib:
             ctypes.c_float,  # tolerance
             ctypes.c_float,  # gradient_epsilon
             ctypes.c_int,    # verbose
+            ctypes.c_int,    # timing_save_interval
             ctypes.POINTER(ctypes.c_int),  # iterations_out
             ctypes.POINTER(ctypes.c_int),  # converged_out
             ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),  # iteration_times_out
@@ -155,7 +156,7 @@ class GaussianFitterLib:
     def fit_histogram(self, histogram_data, nx, ny, x_min, x_max, y_min, y_max,
                      A_init, x0_init, y0_init, sigma_x_init, sigma_y_init, rho_init,
                      learning_rate=1.0e-6, max_iterations=5000, tolerance=1.0e-6,
-                     gradient_epsilon=1.0e-4, verbose=True):
+                     gradient_epsilon=1.0e-4, verbose=True, timing_save_interval=100):
         """Fit 2D Gaussian to histogram data"""
 
         # Ensure contiguous array
@@ -179,6 +180,7 @@ class GaussianFitterLib:
             ctypes.c_float(tolerance),
             ctypes.c_float(gradient_epsilon),
             ctypes.c_int(1 if verbose else 0),
+            ctypes.c_int(timing_save_interval),
             ctypes.byref(iterations_out),
             ctypes.byref(converged_out),
             ctypes.byref(iteration_times_out),
@@ -253,6 +255,7 @@ class GaussianFitterConfig:
 
         # Output settings
         self.output_dir = "output"
+        self.timing_save_interval = 100  # Save iteration times every n iterations
         self.save_plots = True
 
 
@@ -307,6 +310,7 @@ def load_config_from_file(filename):
                     elif key == 'verbose': config.verbose = value.lower() in ('true', '1', 'yes')
                 elif current_section == 'output':
                     if key == 'output_dir': config.output_dir = value
+                    elif key == 'timing_save_interval': config.timing_save_interval = int(value)
                     elif key == 'save_plots': config.save_plots = value.lower() in ('true', '1', 'yes')
 
     return config
@@ -435,12 +439,16 @@ def plot_results(histogram_2d, projections, result, true_params, config):
     if 'iteration_times' in result and result['iteration_times']:
         fig, ax = plt.subplots(figsize=(10, 5))
         iter_times = result['iteration_times']
-        iterations = range(1, len(iter_times) + 1)
 
-        ax.plot(iterations, iter_times, 'b-', linewidth=1, alpha=0.7)
+        # Calculate actual iteration numbers based on timing_save_interval
+        # Iterations are saved at: 1, 1+interval, 1+2*interval, ...
+        interval = config.timing_save_interval
+        iterations = [1 + i * interval for i in range(len(iter_times))]
+
+        ax.plot(iterations, iter_times, 'b-o', linewidth=1, markersize=3, alpha=0.7)
         ax.set_xlabel('Iteration Number')
         ax.set_ylabel('Iteration Time (ms)')
-        ax.set_title('Iteration Time vs Iteration Number')
+        ax.set_title(f'Iteration Time vs Iteration Number (saved every {interval} iterations)')
         ax.grid(True, alpha=0.3)
 
         # Add average line
@@ -455,13 +463,122 @@ def plot_results(histogram_2d, projections, result, true_params, config):
         print(f"  Saved: {output_path / 'iteration_times.jpg'}")
 
         # Print statistics
-        print(f"\n  Iteration time statistics:")
+        print(f"\n  Iteration time statistics (saved every {interval} iterations):")
         print(f"    Average: {avg_time:.2f} ms")
         print(f"    Min: {min(iter_times):.2f} ms")
         print(f"    Max: {max(iter_times):.2f} ms")
-        print(f"    Total: {sum(iter_times):.2f} ms ({sum(iter_times)/1000:.2f} s)")
+        print(f"    Total recorded time: {sum(iter_times):.2f} ms ({sum(iter_times)/1000:.2f} s)")
 
     print("=" * 50)
+
+    # Save configuration and results to text files
+    save_config_and_results(output_path, result, true_params, config)
+
+
+def save_config_and_results(output_path, result, true_params, config):
+    """Save configuration and fitting results to text files"""
+
+    # Save configuration
+    print("\nSaving configuration and results...")
+    config_file = output_path / 'config.txt'
+    with open(config_file, 'w') as f:
+        f.write("=" * 60 + "\n")
+        f.write("  Configuration\n")
+        f.write("=" * 60 + "\n\n")
+
+        f.write("[true_params]\n")
+        f.write(f"  A = {config.true_A}\n")
+        f.write(f"  x0 = {config.true_x0}\n")
+        f.write(f"  y0 = {config.true_y0}\n")
+        f.write(f"  sigma_x = {config.true_sigma_x}\n")
+        f.write(f"  sigma_y = {config.true_sigma_y}\n")
+        f.write(f"  rho = {config.true_rho}\n\n")
+
+        f.write("[histogram]\n")
+        f.write(f"  nx = {config.nx}\n")
+        f.write(f"  ny = {config.ny}\n")
+        f.write(f"  x_min = {config.x_min}\n")
+        f.write(f"  x_max = {config.x_max}\n")
+        f.write(f"  y_min = {config.y_min}\n")
+        f.write(f"  y_max = {config.y_max}\n")
+        f.write(f"  num_samples = {config.num_samples}\n\n")
+
+        f.write("[initial_guess]\n")
+        f.write(f"  A = {config.init_A}\n")
+        f.write(f"  x0 = {config.init_x0}\n")
+        f.write(f"  y0 = {config.init_y0}\n")
+        f.write(f"  sigma_x = {config.init_sigma_x}\n")
+        f.write(f"  sigma_y = {config.init_sigma_y}\n")
+        f.write(f"  rho = {config.init_rho}\n\n")
+
+        f.write("[optimizer]\n")
+        f.write(f"  learning_rate = {config.learning_rate}\n")
+        f.write(f"  max_iterations = {config.max_iterations}\n")
+        f.write(f"  tolerance = {config.tolerance}\n")
+        f.write(f"  gradient_epsilon = {config.gradient_epsilon}\n")
+        f.write(f"  verbose = {config.verbose}\n\n")
+
+        f.write("[output]\n")
+        f.write(f"  output_dir = {config.output_dir}\n")
+        f.write(f"  timing_save_interval = {config.timing_save_interval}\n")
+        f.write(f"  save_plots = {config.save_plots}\n")
+
+    print(f"  Saved: {config_file}")
+
+    # Save fitting results
+    results_file = output_path / 'results.txt'
+    with open(results_file, 'w') as f:
+        f.write("=" * 60 + "\n")
+        f.write("  Fitting Results\n")
+        f.write("=" * 60 + "\n\n")
+
+        f.write(f"Optimization Status:\n")
+        f.write(f"  Iterations: {result['iterations']}\n")
+        f.write(f"  Converged: {result['converged']}\n")
+        f.write(f"  Final Likelihood: {result['final_likelihood']:.6f}\n\n")
+
+        f.write("-" * 60 + "\n")
+        f.write(f"{'Parameter':<12} {'True Value':<15} {'Fitted Value':<15} {'Error (%)':<12}\n")
+        f.write("-" * 60 + "\n")
+
+        params = [
+            ('A', true_params['A'], result['params']['A']),
+            ('x0', true_params['x0'], result['params']['x0']),
+            ('y0', true_params['y0'], result['params']['y0']),
+            ('sigma_x', true_params['sigma_x'], result['params']['sigma_x']),
+            ('sigma_y', true_params['sigma_y'], result['params']['sigma_y']),
+            ('rho', true_params['rho'], result['params']['rho']),
+        ]
+
+        for name, true_val, fit_val in params:
+            error = (fit_val - true_val) / true_val * 100.0 if true_val != 0 else 0
+            f.write(f"{name:<12} {true_val:<15.6f} {fit_val:<15.6f} {error:<12.2f}\n")
+
+        f.write("-" * 60 + "\n")
+
+        # Save iteration time statistics if available
+        if 'iteration_times' in result and result['iteration_times']:
+            f.write(f"\nIteration Time Statistics:\n")
+            f.write(f"  Number of recorded iterations: {len(result['iteration_times'])}\n")
+            f.write(f"  Average: {np.mean(result['iteration_times']):.2f} ms\n")
+            f.write(f"  Min: {min(result['iteration_times']):.2f} ms\n")
+            f.write(f"  Max: {max(result['iteration_times']):.2f} ms\n")
+            f.write(f"  Total: {sum(result['iteration_times']):.2f} ms ({sum(result['iteration_times'])/1000:.2f} s)\n")
+
+    print(f"  Saved: {results_file}")
+
+    # Also save results as CSV for easy parsing
+    csv_file = output_path / 'results.csv'
+    with open(csv_file, 'w') as f:
+        f.write("parameter,true_value,fitted_value,error_percent\n")
+        for name, true_val, fit_val in params:
+            error = (fit_val - true_val) / true_val * 100.0 if true_val != 0 else 0
+            f.write(f"{name},{true_val:.6f},{fit_val:.6f},{error:.2f}\n")
+        f.write(f"iterations,-,{result['iterations']},-\n")
+        f.write(f"converged,-,{1 if result['converged'] else 0},-\n")
+        f.write(f"final_likelihood,-,{result['final_likelihood']:.6f},-\n")
+
+    print(f"  Saved: {csv_file}")
 
 
 def print_results(true_params, fit_params, result):
@@ -557,7 +674,7 @@ def main():
         config.init_A, config.init_x0, config.init_y0,
         config.init_sigma_x, config.init_sigma_y, config.init_rho,
         config.learning_rate, config.max_iterations, config.tolerance,
-        config.gradient_epsilon, config.verbose
+        config.gradient_epsilon, config.verbose, config.timing_save_interval
     )
 
     # Step 4: Print results

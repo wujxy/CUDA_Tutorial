@@ -14,6 +14,7 @@ struct OptimizerConfig {
     float tolerance;         // 收敛容差
     float gradient_epsilon;  // 数值微分的扰动步长
     bool verbose;            // 是否打印详细信息
+    int timing_save_interval; // 保存迭代时间的间隔（默认1，即每次都保存）
 };
 
 /**

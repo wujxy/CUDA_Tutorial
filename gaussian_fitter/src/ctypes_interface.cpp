@@ -99,6 +99,7 @@ extern "C" float* fit_histogram_ctypes(
     float tolerance,
     float gradient_epsilon,
     int verbose,
+    int timing_save_interval,
     int* iterations_out, int* converged_out,
     float** iteration_times_out, int* num_times_out
 ) {
@@ -133,6 +134,7 @@ extern "C" float* fit_histogram_ctypes(
     opt_config.tolerance = tolerance;
     opt_config.gradient_epsilon = gradient_epsilon;
     opt_config.verbose = verbose != 0;
+    opt_config.timing_save_interval = timing_save_interval > 0 ? timing_save_interval : 1;
 
     // Run optimization
     SimpleOptimizer optimizer(opt_config);
