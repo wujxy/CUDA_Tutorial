@@ -97,12 +97,16 @@ class GaussianFitterLib:
             ctypes.c_float,  # sigma_x_init
             ctypes.c_float,  # sigma_y_init
             ctypes.c_float,  # rho_init
+            ctypes.c_int,    # optimizer_type
             ctypes.c_float,  # learning_rate
             ctypes.c_int,    # max_iterations
             ctypes.c_float,  # tolerance
             ctypes.c_float,  # gradient_epsilon
             ctypes.c_int,    # verbose
             ctypes.c_int,    # timing_save_interval
+            ctypes.c_float,  # beta1 (Adam)
+            ctypes.c_float,  # beta2 (Adam)
+            ctypes.c_float,  # epsilon (Adam)
             ctypes.POINTER(ctypes.c_int),  # iterations_out
             ctypes.POINTER(ctypes.c_int),  # converged_out
             ctypes.POINTER(ctypes.POINTER(ctypes.c_float)),  # iteration_times_out
@@ -155,9 +159,15 @@ class GaussianFitterLib:
 
     def fit_histogram(self, histogram_data, nx, ny, x_min, x_max, y_min, y_max,
                      A_init, x0_init, y0_init, sigma_x_init, sigma_y_init, rho_init,
-                     learning_rate=1.0e-6, max_iterations=5000, tolerance=1.0e-6,
-                     gradient_epsilon=1.0e-4, verbose=True, timing_save_interval=100):
-        """Fit 2D Gaussian to histogram data"""
+                     optimizer_type=0, learning_rate=1.0e-6, max_iterations=5000, tolerance=1.0e-6,
+                     gradient_epsilon=1.0e-4, verbose=True, timing_save_interval=100,
+                     beta1=0.9, beta2=0.999, epsilon=1e-8):
+        """Fit 2D Gaussian to histogram data
+
+        Args:
+            optimizer_type: 0 for Simple (gradient descent), 1 for Adam
+            beta1, beta2, epsilon: Adam-specific parameters (only used if optimizer_type=1)
+        """
 
         # Ensure contiguous array
         hist_flat = np.ascontiguousarray(histogram_data.flatten(), dtype=np.int32)
@@ -175,12 +185,16 @@ class GaussianFitterLib:
             ctypes.c_float(y_min), ctypes.c_float(y_max),
             ctypes.c_float(A_init), ctypes.c_float(x0_init), ctypes.c_float(y0_init),
             ctypes.c_float(sigma_x_init), ctypes.c_float(sigma_y_init), ctypes.c_float(rho_init),
+            ctypes.c_int(optimizer_type),
             ctypes.c_float(learning_rate),
             ctypes.c_int(max_iterations),
             ctypes.c_float(tolerance),
             ctypes.c_float(gradient_epsilon),
             ctypes.c_int(1 if verbose else 0),
             ctypes.c_int(timing_save_interval),
+            ctypes.c_float(beta1),
+            ctypes.c_float(beta2),
+            ctypes.c_float(epsilon),
             ctypes.byref(iterations_out),
             ctypes.byref(converged_out),
             ctypes.byref(iteration_times_out),
@@ -247,11 +261,17 @@ class GaussianFitterConfig:
         self.init_rho = 0.2
 
         # Optimizer settings
+        self.optimizer_type = 0  # 0=Simple, 1=Adam
         self.learning_rate = 1.0e-6
         self.max_iterations = 5000
         self.tolerance = 1.0e-6
         self.gradient_epsilon = 1.0e-4
         self.verbose = True
+
+        # Adam optimizer specific parameters (only used if optimizer_type=1)
+        self.beta1 = 0.9
+        self.beta2 = 0.999
+        self.epsilon = 1.0e-8
 
         # Output settings
         self.output_dir = "output"
@@ -303,11 +323,22 @@ def load_config_from_file(filename):
                     elif key == 'sigma_y': config.init_sigma_y = float(value)
                     elif key == 'rho': config.init_rho = float(value)
                 elif current_section == 'optimizer':
-                    if key == 'learning_rate': config.learning_rate = float(value)
+                    if key == 'optimizer_type':
+                        # Map string to integer
+                        opt_type = value.lower()
+                        if opt_type in ('adam', '1'):
+                            config.optimizer_type = 1
+                        else:
+                            config.optimizer_type = 0
+                    elif key == 'learning_rate': config.learning_rate = float(value)
                     elif key == 'max_iterations': config.max_iterations = int(value)
                     elif key == 'tolerance': config.tolerance = float(value)
                     elif key == 'gradient_epsilon': config.gradient_epsilon = float(value)
                     elif key == 'verbose': config.verbose = value.lower() in ('true', '1', 'yes')
+                    elif key == 'timing_save_interval': config.timing_save_interval = int(value)
+                    elif key == 'beta1': config.beta1 = float(value)
+                    elif key == 'beta2': config.beta2 = float(value)
+                    elif key == 'epsilon': config.epsilon = float(value)
                 elif current_section == 'output':
                     if key == 'output_dir': config.output_dir = value
                     elif key == 'timing_save_interval': config.timing_save_interval = int(value)
@@ -512,11 +543,19 @@ def save_config_and_results(output_path, result, true_params, config):
         f.write(f"  rho = {config.init_rho}\n\n")
 
         f.write("[optimizer]\n")
+        optimizer_name = "simple" if config.optimizer_type == 0 else "adam"
+        f.write(f"  optimizer_type = {optimizer_name}\n")
         f.write(f"  learning_rate = {config.learning_rate}\n")
         f.write(f"  max_iterations = {config.max_iterations}\n")
         f.write(f"  tolerance = {config.tolerance}\n")
         f.write(f"  gradient_epsilon = {config.gradient_epsilon}\n")
-        f.write(f"  verbose = {config.verbose}\n\n")
+        f.write(f"  verbose = {config.verbose}\n")
+        f.write(f"  timing_save_interval = {config.timing_save_interval}\n")
+        if config.optimizer_type == 1:
+            f.write(f"  beta1 = {config.beta1}\n")
+            f.write(f"  beta2 = {config.beta2}\n")
+            f.write(f"  epsilon = {config.epsilon}\n")
+        f.write("\n")
 
         f.write("[output]\n")
         f.write(f"  output_dir = {config.output_dir}\n")
@@ -639,6 +678,8 @@ def main():
     print(f"\n[Histogram]")
     print(f"  bins: {config.nx}x{config.ny}, num_samples: {config.num_samples}")
     print(f"\n[Optimizer]")
+    optimizer_name = "Adam" if config.optimizer_type == 1 else "Simple (Gradient Descent)"
+    print(f"  optimizer_type = {optimizer_name}")
     print(f"  learning_rate = {config.learning_rate}, max_iterations = {config.max_iterations}")
     print("=" * 50)
 
@@ -668,13 +709,17 @@ def main():
 
     # Step 3: Fit the histogram
     print("\nStarting optimization...")
+    optimizer_name = "Adam" if config.optimizer_type == 1 else "Simple (Gradient Descent)"
+    print(f"Optimizer: {optimizer_name}")
     result = lib.fit_histogram(
         histogram_2d, config.nx, config.ny,
         config.x_min, config.x_max, config.y_min, config.y_max,
         config.init_A, config.init_x0, config.init_y0,
         config.init_sigma_x, config.init_sigma_y, config.init_rho,
+        config.optimizer_type,
         config.learning_rate, config.max_iterations, config.tolerance,
-        config.gradient_epsilon, config.verbose, config.timing_save_interval
+        config.gradient_epsilon, config.verbose, config.timing_save_interval,
+        config.beta1, config.beta2, config.epsilon
     )
 
     # Step 4: Print results

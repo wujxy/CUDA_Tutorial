@@ -26,6 +26,10 @@ int* generate_histogram_ctypes(
  * histogram_data: array of histogram counts (length = nx * ny)
  * Returns a pointer to result structure (caller must free)
  *
+ * Optimizer types:
+ *   - 0: Simple gradient descent
+ *   - 1: Adam optimizer
+ *
  * Output parameters:
  *   - iterations_out: number of iterations performed
  *   - converged_out: 1 if converged, 0 otherwise
@@ -39,12 +43,17 @@ float* fit_histogram_ctypes(
     float y_min, float y_max,
     float A_init, float x0_init, float y0_init,
     float sigma_x_init, float sigma_y_init, float rho_init,
+    int optimizer_type,              // 0=Simple, 1=Adam
     float learning_rate,
     int max_iterations,
     float tolerance,
     float gradient_epsilon,
     int verbose,
     int timing_save_interval,
+    // Adam optimizer specific parameters (can be set to negative to use defaults)
+    float beta1,                      // Adam: first moment decay rate (default 0.9)
+    float beta2,                      // Adam: second moment decay rate (default 0.999)
+    float epsilon,                    // Adam: numerical stability constant (default 1e-8)
     int* iterations_out, int* converged_out,
     float** iteration_times_out, int* num_times_out
 );

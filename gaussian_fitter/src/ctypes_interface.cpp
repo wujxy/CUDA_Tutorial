@@ -94,12 +94,16 @@ extern "C" float* fit_histogram_ctypes(
     float y_min, float y_max,
     float A_init, float x0_init, float y0_init,
     float sigma_x_init, float sigma_y_init, float rho_init,
+    int optimizer_type,
     float learning_rate,
     int max_iterations,
     float tolerance,
     float gradient_epsilon,
     int verbose,
     int timing_save_interval,
+    float beta1,
+    float beta2,
+    float epsilon,
     int* iterations_out, int* converged_out,
     float** iteration_times_out, int* num_times_out
 ) {
@@ -129,6 +133,7 @@ extern "C" float* fit_histogram_ctypes(
 
     // Configure optimizer
     OptimizerConfig opt_config;
+    opt_config.optimizer_type = static_cast<OptimizerType>(optimizer_type);
     opt_config.learning_rate = learning_rate;
     opt_config.max_iterations = max_iterations;
     opt_config.tolerance = tolerance;
@@ -136,10 +141,26 @@ extern "C" float* fit_histogram_ctypes(
     opt_config.verbose = verbose != 0;
     opt_config.timing_save_interval = timing_save_interval > 0 ? timing_save_interval : 1;
 
+    // Set Adam-specific parameters (use defaults if not provided)
+    opt_config.beta1 = (beta1 > 0.0f) ? beta1 : -1.0f;  // negative triggers default
+    opt_config.beta2 = (beta2 > 0.0f) ? beta2 : -1.0f;
+    opt_config.epsilon = (epsilon > 0.0f) ? epsilon : -1.0f;
+
+    // Create appropriate optimizer based on type
+    Optimizer* optimizer = nullptr;
+    if (opt_config.optimizer_type == OptimizerType::ADAM) {
+        optimizer = new AdamOptimizer(opt_config);
+    } else {
+        // Default to SimpleOptimizer
+        optimizer = new SimpleOptimizer(opt_config);
+    }
+
     // Run optimization
-    SimpleOptimizer optimizer(opt_config);
-    optimizer.setData(hist);
-    OptimizationResult result = optimizer.optimize(init_params);
+    optimizer->setData(hist);
+    OptimizationResult result = optimizer->optimize(init_params);
+
+    // Clean up optimizer
+    delete optimizer;
 
     // Set output parameters
     *iterations_out = result.iterations;
