@@ -155,6 +155,9 @@ OptimizationResult SimpleOptimizer::optimize(const GaussianParams& initial_param
 
     float current_likelihood = computeLikelihood(initial_params);
     result.final_likelihood = current_likelihood;
+    result.likelihood_history.push_back(current_likelihood);
+
+    int skipped_count = 0;  // 连续跳过的次数
 
     if (config.verbose) {
         printf("\n=== Gradient Descent Optimization ===\n");
@@ -163,6 +166,9 @@ OptimizationResult SimpleOptimizer::optimize(const GaussianParams& initial_param
     }
 
     for (int iter = 0; iter < config.max_iterations; iter++) {
+        // 记录迭代开始时间
+        auto iter_start = std::chrono::high_resolution_clock::now();
+
         // 计算梯度
         float gradient[6];
         computeGradient(result.params, gradient);
@@ -173,9 +179,9 @@ OptimizationResult SimpleOptimizer::optimize(const GaussianParams& initial_param
 
         // 更新参数（使用较小的固定步长）
         result.params.A        -= config.learning_rate * gradient[0];
-        result.params.x0       -= config.learning_rate * gradient[1] * 0.01f;  // x0需要较小步长
-        result.params.y0       -= config.learning_rate * gradient[2] * 0.01f;  // y0需要较小步长
-        result.params.sigma_x  -= config.learning_rate * gradient[3] * 0.001f; // sigma需要更小步长
+        result.params.x0       -= config.learning_rate * gradient[1] * 0.01f;
+        result.params.y0       -= config.learning_rate * gradient[2] * 0.01f;
+        result.params.sigma_x  -= config.learning_rate * gradient[3] * 0.001f;
         result.params.sigma_y  -= config.learning_rate * gradient[4] * 0.001f;
         result.params.rho      -= config.learning_rate * gradient[5] * 0.01f;
 
@@ -185,33 +191,61 @@ OptimizationResult SimpleOptimizer::optimize(const GaussianParams& initial_param
         float new_likelihood = computeLikelihood(result.params);
         result.iterations = iter + 1;
 
-        // 如果似然增加了，回退并使用更小的步长
-        if (new_likelihood > old_likelihood) {
-            result.params = old_params;
-            config.learning_rate *= 0.5f;  // 降低学习率
+        // 记录迭代时间
+        auto iter_end = std::chrono::high_resolution_clock::now();
+        float iter_time_ms = std::chrono::duration<float, std::milli>(iter_end - iter_start).count();
+        result.iteration_times.push_back(iter_time_ms);
 
-            if (config.verbose && iter % 100 == 0) {
-                printf("Iter %4d: Likelihood increased, reducing LR to %.6e\n",
-                       iter + 1, config.learning_rate);
-            }
-            current_likelihood = old_likelihood;
-        } else {
-            current_likelihood = new_likelihood;
-            result.final_likelihood = new_likelihood;
+        // 检查是否跳过这次更新
+        float likelihood_change = new_likelihood - old_likelihood;
+        float relative_change = fabsf(likelihood_change) / (fabsf(old_likelihood) + 1e-10f);
+        bool is_warmup = (iter < 100);  // 前100次迭代作为预热期
 
-            if (config.verbose && iter % 100 == 0) {
-                printf("Iter %4d: L = %.6f, LR = %.6e\n", iter + 1, new_likelihood, config.learning_rate);
-            }
-        }
-
-        // 检查收敛
+        // 计算参数变化幅度
         float param_change = fabsf(result.params.A - old_params.A) +
                             fabsf(result.params.x0 - old_params.x0) +
                             fabsf(result.params.y0 - old_params.y0);
-        if (param_change < config.tolerance) {
+
+        if (new_likelihood > old_likelihood && relative_change > 1e-8f && !is_warmup && param_change > 1e-8f) {
+            // 似然显著增加且参数有实际变化，恢复旧参数
+            result.params = old_params;
+            current_likelihood = old_likelihood;
+            result.likelihood_history.push_back(current_likelihood);
+            skipped_count++;
+
+            if (config.verbose && iter % 100 == 0) {
+                printf("Iter %4d: Skipped (likelihood increased: %.6e -> %.6e)\n",
+                       iter + 1, old_likelihood, new_likelihood);
+            }
+        } else {
+            // 接受新参数
+            current_likelihood = new_likelihood;
+            result.final_likelihood = new_likelihood;
+            result.likelihood_history.push_back(new_likelihood);
+            skipped_count = 0;
+
+            if (config.verbose && iter % 100 == 0) {
+                printf("Iter %4d: L = %.6f, LR = %.6e, Time = %.2f ms\n",
+                       iter + 1, new_likelihood, config.learning_rate, iter_time_ms);
+            }
+
+            // 检查收敛
+            if (!is_warmup && iter >= 100) {
+                if (param_change < config.tolerance) {
+                    result.converged = true;
+                    if (config.verbose) {
+                        printf("\nConverged after %d iterations!\n", iter + 1);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 如果连续跳过太多，说明可能已经收敛
+        if (skipped_count > 500) {
             result.converged = true;
             if (config.verbose) {
-                printf("\nConverged after %d iterations!\n", iter + 1);
+                printf("\nConverged (skipped too many iterations)!\n");
             }
             break;
         }
@@ -221,6 +255,16 @@ OptimizationResult SimpleOptimizer::optimize(const GaussianParams& initial_param
         printf("\nFinal likelihood: %.6f\n", result.final_likelihood);
         printParams("Final", result.params);
         printf("Converged: %s\n", result.converged ? "Yes" : "No");
+
+        // 计算平均迭代时间
+        if (!result.iteration_times.empty()) {
+            float total_time = 0.0f;
+            for (float t : result.iteration_times) {
+                total_time += t;
+            }
+            printf("Average iteration time: %.2f ms\n", total_time / result.iteration_times.size());
+            printf("Total optimization time: %.2f ms\n", total_time);
+        }
         printf("=====================================\n\n");
     }
 

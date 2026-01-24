@@ -9,6 +9,7 @@
 #include "include/fit_model.h"
 #include "include/config.h"
 #include "include/cuda_utils.h"
+#include "include/visualization.h"
 
 using namespace std;
 
@@ -187,6 +188,13 @@ int main(int argc, char* argv[]) {
 
     // Step 4: 打印结果比较
     printComparison(config.true_params, result.params);
+
+    // Step 5: 生成可视化输出
+    if (config.save_plots) {
+        cout << "\nGenerating visualization outputs..." << endl;
+        Visualizer viz(config.output_dir);
+        viz.generateAllOutputs(hist, result, config.true_params, config);
+    }
 
     // 清理
     cudaFree(hist.data);

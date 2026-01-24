@@ -2,6 +2,8 @@
 #define FIT_MODEL_H
 
 #include "model.h"
+#include <vector>
+#include <chrono>
 
 /**
  * 优化器配置
@@ -22,6 +24,10 @@ struct OptimizationResult {
     float final_likelihood;  // 最终似然值
     int iterations;          // 实际迭代次数
     bool converged;          // 是否收敛
+
+    // 性能监测数据
+    std::vector<float> iteration_times;  // 每次迭代的时间（毫秒）
+    std::vector<float> likelihood_history;  // 每次迭代的似然值
 };
 
 /**

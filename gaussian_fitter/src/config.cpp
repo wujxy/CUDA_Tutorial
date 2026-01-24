@@ -37,6 +37,11 @@ Config::Config() {
     tolerance = 1.0e-6f;
     gradient_epsilon = 1.0e-4f;
     verbose = true;
+
+    // 默认输出配置
+    output_dir = "output";
+    timing_save_interval = 100;
+    save_plots = true;
 }
 
 bool Config::loadFromFile(const std::string& filename) {
@@ -92,6 +97,11 @@ bool Config::loadFromFile(const std::string& filename) {
     tolerance = getFloat(params, "optimizer", "tolerance", tolerance);
     gradient_epsilon = getFloat(params, "optimizer", "gradient_epsilon", gradient_epsilon);
     verbose = getBool(params, "optimizer", "verbose", verbose);
+
+    // [output]
+    output_dir = params["output_output_dir"].empty() ? output_dir : params["output_output_dir"];
+    timing_save_interval = getInt(params, "output", "timing_save_interval", timing_save_interval);
+    save_plots = getBool(params, "output", "save_plots", save_plots);
 
     std::cout << "Loaded config from: " << filename << std::endl;
     return true;
@@ -214,6 +224,11 @@ void Config::print() const {
     std::cout << "  tolerance = " << tolerance << std::endl;
     std::cout << "  gradient_epsilon = " << gradient_epsilon << std::endl;
     std::cout << "  verbose = " << (verbose ? "true" : "false") << std::endl;
+
+    std::cout << "\n[Output]" << std::endl;
+    std::cout << "  output_dir = " << output_dir << std::endl;
+    std::cout << "  timing_save_interval = " << timing_save_interval << std::endl;
+    std::cout << "  save_plots = " << (save_plots ? "true" : "false") << std::endl;
 
     std::cout << "========================================" << std::endl;
 }

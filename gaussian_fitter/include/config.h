@@ -29,6 +29,11 @@ public:
     float gradient_epsilon;
     bool verbose;
 
+    // 输出配置
+    std::string output_dir;        // 输出目录路径
+    int timing_save_interval;      // 每n轮迭代保存一次时间（默认100）
+    bool save_plots;               // 是否保存图像
+
     /**
      * 默认构造函数 - 设置默认值
      */

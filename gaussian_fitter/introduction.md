@@ -11,6 +11,7 @@
 - **正确的PDF归一化**: 对于撒点方式，PDF正确归一化使得积分等于总样本数
 - **自适应学习率优化**: 简洁的梯度下降优化器，支持自动调整学习率
 - **完整2D高斯模型**: 包含6个自由参数（幅值、中心位置、宽度、相关系数）
+- **性能监测与可视化**: 自动记录每轮迭代时间，生成拟合质量图表和性能分析图
 
 ---
 
@@ -81,13 +82,20 @@ gaussion_fitter/
 │   ├── model.h              # 数据结构定义
 │   ├── model_kernels.cuh    # CUDA kernel声明
 │   ├── fit_model.h          # 简化优化器接口
+│   ├── config.h             # 配置文件解析
+│   ├── visualization.h      # 可视化模块接口
 │   └── cuda_utils.h         # 工具函数
 ├── src/
 │   ├── model.cu             # CUDA kernel实现（归一化PDF）
 │   ├── fit_model.cu         # 简化优化器实现
+│   ├── config.cpp           # 配置文件解析实现
+│   ├── visualization.cpp    # 可视化模块实现
 │   └── cuda_utils.cu        # 工具函数实现
 ├── run.cpp                  # 主程序（撒点方式生成数据）
+├── config_default.conf      # 默认配置文件
+├── config_high_precision.conf # 高精度配置文件
 ├── Makefile                 # 编译配置
+├── run.sh                   # 运行脚本
 └── introduction.md          # 本文档
 ```
 
@@ -239,6 +247,100 @@ OptimizationResult SimpleOptimizer::optimize(
 
 ---
 
+## 性能监测与可视化
+
+本项目新增了完整的性能监测和可视化功能，可以自动生成拟合质量分析和性能报告。
+
+### 输出文件结构
+
+运行后，所有输出文件保存在 `output/` 目录：
+
+```
+output/
+├── config.txt              # 当前运行的配置参数
+├── results.txt             # 拟合结果摘要（参数比较、误差统计）
+├── histogram_x_data.csv    # X方向投影数据和拟合曲线
+├── histogram_y_data.csv    # Y方向投影数据和拟合曲线
+├── histogram_2d_data.csv   # 完整2D直方图数据
+├── iteration_times.csv     # 每轮迭代时间记录
+├── likelihood_history.csv  # 似然值变化历史
+├── plot_results.py         # Python绘图脚本
+├── histogram_x.jpg         # X方向直方图+拟合曲线
+├── histogram_y.jpg         # Y方向直方图+拟合曲线
+├── histogram_2d.jpg        # 2D热图
+├── iteration_times.jpg     # 迭代时间变化图
+└── likelihood_history.jpg  # 似然值收敛曲线
+```
+
+### 拟合质量检测
+
+**1. 1D投影直方图** - X和Y方向的边缘分布
+
+- 将2D直方图投影到X和Y轴
+- 叠加拟合的高斯曲线和真实高斯曲线
+- 用于验证拟合质量
+
+**2. 完整2D分布**
+
+- 2D热图显示完整的观测分布
+- 直观展示高斯峰的位置和形状
+- 可以观察相关系数的影响
+
+### CUDA加速性能检测
+
+**迭代时间监测**:
+
+- 每轮迭代自动记录执行时间（毫秒）
+- 使用 `std::chrono::high_resolution_clock` 精确计时
+- 保存所有迭代时间到CSV文件
+- 生成时间变化折线图
+
+**配置参数** (在配置文件的 `[output]` 部分):
+
+```ini
+[output]
+output_dir = output           # 输出目录
+timing_save_interval = 100    # 时间记录间隔（已自动记录每次迭代）
+save_plots = true             # 是否生成图像
+```
+
+### 生成图像
+
+运行程序后，执行Python脚本生成JPG图像：
+
+```bash
+cd output
+python3 plot_results.py
+```
+
+**生成的图像**:
+
+1. `histogram_x.jpg` - X方向直方图 + 拟合曲线
+2. `histogram_y.jpg` - Y方向直方图 + 拟合曲线
+3. `histogram_2d.jpg` - 2D热图
+4. `iteration_times.jpg` - 迭代时间变化图
+5. `likelihood_history.jpg` - 似然值收敛曲线
+
+### 典型输出示例
+
+```
+=== Parameter Comparison ===
+Parameter   True Value     Fitted Value   Error (%)
+---------------------------------------------------------
+A           10000          9999.93        -0.00%
+x0          1.00           1.15           15.37%
+y0          -0.50          -0.54          8.73%
+sigma_x     0.80           0.98           22.06%
+sigma_y     1.20           1.06           -11.58%
+rho         -0.40          -0.33          -16.88%
+
+=== Performance Summary ===
+Average iteration time: 0.74 ms
+Total optimization time: 52.43 ms
+```
+
+---
+
 ## 编译和运行
 
 ### 编译
@@ -317,8 +419,13 @@ Converged after 2275 iterations!
 |------|------|
 | [run.cpp](run.cpp) | 撒点方式生成数据，主程序入口 |
 | [src/model.cu](src/model.cu) | 归一化PDF，CUDA kernels |
-| [src/fit_model.cu](src/fit_model.cu) | 简化优化器 |
+| [src/fit_model.cu](src/fit_model.cu) | 简化优化器，带时间监测 |
 | [include/fit_model.h](include/fit_model.h) | 优化器接口 |
+| [src/visualization.cpp](src/visualization.cpp) | 可视化模块实现 |
+| [include/visualization.h](include/visualization.h) | 可视化模块接口 |
+| [src/config.cpp](src/config.cpp) | 配置文件解析 |
+| [include/config.h](include/config.h) | 配置类定义 |
+| [config_default.conf](config_default.conf) | 默认配置文件 |
 
 ---
 
