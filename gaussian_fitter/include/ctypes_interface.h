@@ -73,6 +73,53 @@ void free_fit_result_ctypes(float* data);
  */
 void free_iteration_times_ctypes(float* data);
 
+/**
+ * 2D Likelihood scan for (x0, y0) parameters
+ * Scans the likelihood function over a 2D grid of (x0, y0) values
+ * while keeping other parameters fixed at their fitted values.
+ *
+ * @param histogram_data: observed histogram data
+ * @param nx, ny: histogram dimensions
+ * @param x_min, x_max, y_min, y_max: coordinate ranges
+ * @param A_fit, sigma_x_fit, sigma_y_fit, rho_fit: fixed fitted parameters
+ * @param x0_center, y0_center: center of scan region (usually fitted values)
+ * @param x0_range, y0_range: half-width of scan region
+ * @param nx_scan, ny_scan: number of scan points in each direction
+ *
+ * Returns: pointer to result array containing:
+ *   [0]: min_likelihood
+ *   [1]: x0_at_min
+ *   [2]: y0_at_min
+ *   [3]: x0_error_plus
+ *   [4]: x0_error_minus
+ *   [5]: y0_error_plus
+ *   [6]: y0_error_minus
+ *   [7-7+nx_scan]: x0_values array
+ *   [7+nx_scan-7+nx_scan+ny_scan]: y0_values array
+ *   [7+nx_scan+ny_scan-end]: likelihood grid (nx_scan * ny_scan)
+ *
+ * Output parameters:
+ *   - nx_out: number of x0 scan points
+ *   - ny_out: number of y0 scan points
+ *   - likelihood_size_out: size of likelihood grid
+ */
+float* likelihood_scan_2d_ctypes(
+    const int* histogram_data,
+    int nx, int ny,
+    float x_min, float x_max,
+    float y_min, float y_max,
+    float A_fit, float sigma_x_fit, float sigma_y_fit, float rho_fit,
+    float x0_center, float y0_center,
+    float x0_range, float y0_range,
+    int nx_scan, int ny_scan,
+    int* nx_out, int* ny_out, int* likelihood_size_out
+);
+
+/**
+ * Free likelihood scan result
+ */
+void free_likelihood_scan_ctypes(float* data);
+
 #ifdef __cplusplus
 }
 #endif

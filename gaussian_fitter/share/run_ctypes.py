@@ -122,6 +122,34 @@ class GaussianFitterLib:
         # free_iteration_times_ctypes
         self.lib.free_iteration_times_ctypes.argtypes = [ctypes.POINTER(ctypes.c_float)]
 
+        # likelihood_scan_2d_ctypes
+        self.lib.likelihood_scan_2d_ctypes.restype = ctypes.POINTER(ctypes.c_float)
+        self.lib.likelihood_scan_2d_ctypes.argtypes = [
+            ctypes.POINTER(ctypes.c_int),  # histogram_data
+            ctypes.c_int,    # nx
+            ctypes.c_int,    # ny
+            ctypes.c_float,  # x_min
+            ctypes.c_float,  # x_max
+            ctypes.c_float,  # y_min
+            ctypes.c_float,  # y_max
+            ctypes.c_float,  # A_fit
+            ctypes.c_float,  # sigma_x_fit
+            ctypes.c_float,  # sigma_y_fit
+            ctypes.c_float,  # rho_fit
+            ctypes.c_float,  # x0_center
+            ctypes.c_float,  # y0_center
+            ctypes.c_float,  # x0_range
+            ctypes.c_float,  # y0_range
+            ctypes.c_int,    # nx_scan
+            ctypes.c_int,    # ny_scan
+            ctypes.POINTER(ctypes.c_int),  # nx_out
+            ctypes.POINTER(ctypes.c_int),  # ny_out
+            ctypes.POINTER(ctypes.c_int),  # likelihood_size_out
+        ]
+
+        # free_likelihood_scan_ctypes
+        self.lib.free_likelihood_scan_ctypes.argtypes = [ctypes.POINTER(ctypes.c_float)]
+
     def generate_histogram(self, A, x0, y0, sigma_x, sigma_y, rho,
                           nx, ny, x_min, x_max, y_min, y_max, num_samples):
         """Generate 2D Gaussian histogram"""
@@ -228,6 +256,85 @@ class GaussianFitterLib:
 
         # Free result
         self.lib.free_fit_result_ctypes(result_ptr)
+
+        return result
+
+    def likelihood_scan_2d(self, histogram_data, nx, ny, x_min, x_max, y_min, y_max,
+                           A_fit, sigma_x_fit, sigma_y_fit, rho_fit,
+                           x0_center, y0_center, x0_range, y0_range,
+                           nx_scan=50, ny_scan=50):
+        """Perform 2D likelihood scan over (x0, y0) parameter space
+
+        Args:
+            histogram_data: 2D histogram data
+            nx, ny: histogram dimensions
+            x_min, x_max, y_min, y_max: coordinate ranges
+            A_fit, sigma_x_fit, sigma_y_fit, rho_fit: fixed fitted parameters
+            x0_center, y0_center: center of scan region
+            x0_range, y0_range: half-width of scan region
+            nx_scan, ny_scan: number of scan points
+
+        Returns:
+            Dictionary with scan results including:
+            - x0_values, y0_values: scan grid
+            - likelihood: 2D likelihood array
+            - min_likelihood, x0_at_min, y0_at_min: minimum info
+            - x0_error_plus, x0_error_minus: x0 1-sigma errors
+            - y0_error_plus, y0_error_minus: y0 1-sigma errors
+        """
+        # Ensure contiguous array
+        hist_flat = np.ascontiguousarray(histogram_data.flatten(), dtype=np.int32)
+        hist_ptr = hist_flat.ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+
+        nx_out = ctypes.c_int()
+        ny_out = ctypes.c_int()
+        likelihood_size_out = ctypes.c_int()
+
+        result_ptr = self.lib.likelihood_scan_2d_ctypes(
+            hist_ptr,
+            ctypes.c_int(nx), ctypes.c_int(ny),
+            ctypes.c_float(x_min), ctypes.c_float(x_max),
+            ctypes.c_float(y_min), ctypes.c_float(y_max),
+            ctypes.c_float(A_fit),
+            ctypes.c_float(sigma_x_fit),
+            ctypes.c_float(sigma_y_fit),
+            ctypes.c_float(rho_fit),
+            ctypes.c_float(x0_center),
+            ctypes.c_float(y0_center),
+            ctypes.c_float(x0_range),
+            ctypes.c_float(y0_range),
+            ctypes.c_int(nx_scan),
+            ctypes.c_int(ny_scan),
+            ctypes.byref(nx_out),
+            ctypes.byref(ny_out),
+            ctypes.byref(likelihood_size_out)
+        )
+
+        # Parse result array
+        # Layout: [7 summary values] [nx_scan x0 values] [ny_scan y0 values] [nx_scan*ny_scan likelihood values]
+        nx_scan = nx_out.value
+        ny_scan = ny_out.value
+
+        result = {
+            'min_likelihood': result_ptr[0],
+            'x0_at_min': result_ptr[1],
+            'y0_at_min': result_ptr[2],
+            'x0_error_plus': result_ptr[3],
+            'x0_error_minus': result_ptr[4],
+            'y0_error_plus': result_ptr[5],
+            'y0_error_minus': result_ptr[6],
+            'x0_values': [result_ptr[7 + i] for i in range(nx_scan)],
+            'y0_values': [result_ptr[7 + nx_scan + j] for j in range(ny_scan)],
+        }
+
+        # Copy likelihood grid
+        likelihood_offset = 7 + nx_scan + ny_scan
+        likelihood_size = likelihood_size_out.value
+        likelihood_grid = [result_ptr[likelihood_offset + i] for i in range(likelihood_size)]
+        result['likelihood'] = np.array(likelihood_grid).reshape(ny_scan, nx_scan)
+
+        # Free result
+        self.lib.free_likelihood_scan_ctypes(result_ptr)
 
         return result
 
@@ -648,6 +755,162 @@ def print_results(true_params, fit_params, result):
     print("=" * 50)
 
 
+def plot_likelihood_contour(scan_result, fit_params, output_path):
+    """Plot 2D likelihood contour with error bars
+
+    Args:
+        scan_result: Dictionary from likelihood_scan_2d
+        fit_params: Fitted parameters
+        output_path: Path to save the plot
+    """
+    print("\n" + "=" * 50)
+    print("  Generating Likelihood Contour Plot")
+    print("=" * 50)
+
+    plt.style.use('seaborn-v0_8-darkgrid')
+    plt.rcParams['figure.dpi'] = 100
+    plt.rcParams['savefig.dpi'] = 300
+    plt.rcParams['font.size'] = 10
+
+    # Prepare data
+    x0_vals = scan_result['x0_values']
+    y0_vals = scan_result['y0_values']
+    likelihood = scan_result['likelihood']
+
+    # Create meshgrid for contour
+    X, Y = np.meshgrid(x0_vals, y0_vals)
+
+    # Calculate delta chi-squared
+    delta_chi2 = likelihood - scan_result['min_likelihood']
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # Plot filled contours
+    levels = [0, 1.0, 2.0, 3.0, 4.0, 5.0]  # Δχ² levels
+    colors = ['#fee5d9', '#fcae91', '#fb6a4a', '#de2d26', '#a50f15']
+    contourf = ax.contourf(X, Y, delta_chi2, levels=levels, colors=colors, alpha=0.7)
+
+    # Plot contour lines
+    contour = ax.contour(X, Y, delta_chi2, levels=levels[1:], colors='white', linewidths=1.5)
+    ax.clabel(contour, inline=True, fontsize=10, fmt='Δχ²=%.1f')
+
+    # Mark the minimum point
+    ax.plot(scan_result['x0_at_min'], scan_result['y0_at_min'], 'ko',
+            markersize=10, markerfacecolor='yellow', markeredgewidth=2,
+            label=f'Minimum: (x0={scan_result["x0_at_min"]:.4f}, y0={scan_result["y0_at_min"]:.4f})')
+
+    # Mark the true values if available
+    if fit_params.get('true_x0') is not None and fit_params.get('true_y0') is not None:
+        ax.plot(fit_params['true_x0'], fit_params['true_y0'], 'g*',
+                markersize=15, markerfacecolor='green', markeredgewidth=2,
+                label=f'True: (x0={fit_params["true_x0"]:.4f}, y0={fit_params["true_y0"]:.4f})')
+
+    # Plot error bars (intersection method)
+    # Horizontal error bar (x0 errors)
+    x0_err_neg = scan_result['x0_error_minus']
+    x0_err_pos = scan_result['x0_error_plus']
+    y0_err_neg = scan_result['y0_error_minus']
+    y0_err_pos = scan_result['y0_error_plus']
+
+    # Validate error values (must be positive)
+    if np.isfinite(x0_err_neg) and x0_err_neg > 0 and np.isfinite(x0_err_pos) and x0_err_pos > 0:
+        ax.errorbar(scan_result['x0_at_min'], scan_result['y0_at_min'],
+                    xerr=[[x0_err_neg], [x0_err_pos]],
+                    fmt='none', ecolor='blue', elinewidth=2, capsize=5, capthick=2,
+                    label=f'x0: {scan_result["x0_at_min"]:.4f} +{x0_err_pos:.4f} -{x0_err_neg:.4f}')
+
+        # Mark x-axis intersections
+        x0_min = scan_result['x0_at_min'] - x0_err_neg
+        x0_max = scan_result['x0_at_min'] + x0_err_pos
+        ax.plot([x0_min, x0_max], [scan_result['y0_at_min'], scan_result['y0_at_min']],
+                'b>', markersize=8, label='x-axis intersections')
+    else:
+        print(f"    Warning: x0 error estimates invalid (neg={x0_err_neg:.4f}, pos={x0_err_pos:.4f})")
+
+    # Vertical error bar (y0 errors)
+    if np.isfinite(y0_err_neg) and y0_err_neg > 0 and np.isfinite(y0_err_pos) and y0_err_pos > 0:
+        ax.errorbar(scan_result['x0_at_min'], scan_result['y0_at_min'],
+                    yerr=[[y0_err_neg], [y0_err_pos]],
+                    fmt='none', ecolor='red', elinewidth=2, capsize=5, capthick=2,
+                    label=f'y0: {scan_result["y0_at_min"]:.4f} +{y0_err_pos:.4f} -{y0_err_neg:.4f}')
+
+        # Mark y-axis intersections
+        y0_min = scan_result['y0_at_min'] - y0_err_neg
+        y0_max = scan_result['y0_at_min'] + y0_err_pos
+        ax.plot([scan_result['x0_at_min'], scan_result['x0_at_min']],
+                [y0_min, y0_max],
+                'r<', markersize=8, label='y-axis intersections')
+    else:
+        print(f"    Warning: y0 error estimates invalid (neg={y0_err_neg:.4f}, pos={y0_err_pos:.4f})")
+
+    # Labels and title
+    ax.set_xlabel('x₀')
+    ax.set_ylabel('y₀')
+    ax.set_title('2D Likelihood Contour for (x₀, y₀) Parameters\nΔχ² = 1 corresponds to 1σ confidence region')
+
+    # Auto-adjust axis limits to highlight the contour region
+    # Use error values to set appropriate limits, but ensure minimum range
+    x0_err_max = max(scan_result['x0_error_minus'], scan_result['x0_error_plus'])
+    y0_err_max = max(scan_result['y0_error_minus'], scan_result['y0_error_plus'])
+
+    # Set limits to center ± (3-5 times the error), or use full scan range if errors are large
+    # Also ensure true value and fitted value are visible
+    x_margin = max(x0_err_max * 5, 0.01)  # At least 0.01 range
+    y_margin = max(y0_err_max * 5, 0.01)
+
+    # Also include true value and fitted value in the view
+    if fit_params.get('true_x0') is not None:
+        x_center = (scan_result['x0_at_min'] + fit_params['true_x0']) / 2
+        x_span = abs(scan_result['x0_at_min'] - fit_params['true_x0'])
+        x_margin = max(x_margin, x_span * 2)
+
+    if fit_params.get('true_y0') is not None:
+        y_center = (scan_result['y0_at_min'] + fit_params['true_y0']) / 2
+        y_span = abs(scan_result['y0_at_min'] - fit_params['true_y0'])
+        y_margin = max(y_margin, y_span * 2)
+
+    ax.set_xlim(scan_result['x0_at_min'] - x_margin,
+                scan_result['x0_at_min'] + x_margin)
+    ax.set_ylim(scan_result['y0_at_min'] - y_margin,
+                scan_result['y0_at_min'] + y_margin)
+
+    print(f"    Axis limits adjusted: x0 ±{x_margin:.4f}, y0 ±{y_margin:.4f}")
+
+    # Add colorbar
+    cbar = plt.colorbar(contourf, ax=ax)
+    cbar.set_label('Δχ² = L(x₀,y₀) - L_min')
+
+    # Add legend
+    ax.legend(loc='best', fontsize=9)
+
+    # Add grid
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_path / 'likelihood_contour.jpg', format='jpg', bbox_inches='tight', dpi=300)
+    plt.close()
+
+    print(f"  Saved: {output_path / 'likelihood_contour.jpg'}")
+
+    # Print summary
+    print("\n  Likelihood Contour Summary:")
+    print(f"    Minimum likelihood: {scan_result['min_likelihood']:.6f}")
+    print(f"    x0: {scan_result['x0_at_min']:.4f} +{scan_result['x0_error_plus']:.4f} -{scan_result['x0_error_minus']:.4f}")
+    print(f"    y0: {scan_result['y0_at_min']:.4f} +{scan_result['y0_error_plus']:.4f} -{scan_result['y0_error_minus']:.4f}")
+    if fit_params.get('true_x0') is not None:
+        x0_low = scan_result['x0_at_min'] - scan_result['x0_error_minus']
+        x0_high = scan_result['x0_at_min'] + scan_result['x0_error_plus']
+        y0_low = scan_result['y0_at_min'] - scan_result['y0_error_minus']
+        y0_high = scan_result['y0_at_min'] + scan_result['y0_error_plus']
+        x0_in_interval = x0_low <= fit_params['true_x0'] <= x0_high
+        y0_in_interval = y0_low <= fit_params['true_y0'] <= y0_high
+        print(f"    x0_true = {fit_params['true_x0']:.4f} in [{x0_low:.4f}, {x0_high:.4f}]: {x0_in_interval}")
+        print(f"    y0_true = {fit_params['true_y0']:.4f} in [{y0_low:.4f}, {y0_high:.4f}]: {y0_in_interval}")
+
+    print("=" * 50)
+
+
 def main():
     """Main entry point"""
     print("=" * 50)
@@ -731,6 +994,45 @@ def main():
 
     # Step 5: Generate plots
     plot_results(histogram_2d, projections, result, true_params, config)
+
+    # Step 6: 2D likelihood scan and contour plot
+    print("\n" + "=" * 50)
+    print("  Performing 2D Likelihood Scan")
+    print("=" * 50)
+
+    # Use fitted parameters (except x0, y0 which will be scanned)
+    fit_params_for_scan = result['params']
+    x0_center = result['params']['x0']
+    y0_center = result['params']['y0']
+    x0_range = 0.1  # Scan range around fitted value (increased for better error estimation)
+    y0_range = 0.1
+    nx_scan = 50
+    ny_scan = 50
+
+    print(f"Scanning around (x0={x0_center:.4f}, y0={y0_center:.4f})")
+    print(f"Scan range: ±{x0_range} in x0, ±{y0_range} in y0")
+    print(f"Grid size: {nx_scan} x {ny_scan}")
+
+    scan_result = lib.likelihood_scan_2d(
+        histogram_2d, config.nx, config.ny,
+        config.x_min, config.x_max, config.y_min, config.y_max,
+        fit_params_for_scan['A'],
+        fit_params_for_scan['sigma_x'],
+        fit_params_for_scan['sigma_y'],
+        fit_params_for_scan['rho'],
+        x0_center, y0_center,
+        x0_range, y0_range,
+        nx_scan, ny_scan
+    )
+
+    # Add true values to fit_params for plotting
+    fit_params_with_true = fit_params_for_scan.copy()
+    fit_params_with_true['true_x0'] = config.true_x0
+    fit_params_with_true['true_y0'] = config.true_y0
+
+    # Plot likelihood contour
+    output_path = Path(config.output_dir)
+    plot_likelihood_contour(scan_result, fit_params_with_true, output_path)
 
     print(f"\nAll outputs saved to: {config.output_dir}/")
 

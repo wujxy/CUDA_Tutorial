@@ -214,3 +214,94 @@ extern "C" void free_fit_result_ctypes(float* data) {
 extern "C" void free_iteration_times_ctypes(float* data) {
     cudaFree(data);
 }
+
+/**
+ * 2D Likelihood scan - C interface for ctypes
+ */
+extern "C" float* likelihood_scan_2d_ctypes(
+    const int* histogram_data,
+    int nx, int ny,
+    float x_min, float x_max,
+    float y_min, float y_max,
+    float A_fit, float sigma_x_fit, float sigma_y_fit, float rho_fit,
+    float x0_center, float y0_center,
+    float x0_range, float y0_range,
+    int nx_scan, int ny_scan,
+    int* nx_out, int* ny_out, int* likelihood_size_out
+) {
+    // Create Histogram2D from input data
+    Histogram2D hist;
+    hist.nx = nx;
+    hist.ny = ny;
+    hist.x_min = x_min;
+    hist.x_max = x_max;
+    hist.y_min = y_min;
+    hist.y_max = y_max;
+
+    int nbins = nx * ny;
+    CUDA_CHECK(cudaMallocManaged(&hist.data, nbins * sizeof(int)));
+    for (int i = 0; i < nbins; i++) {
+        hist.data[i] = histogram_data[i];
+    }
+
+    // Set fixed parameters (fitted values except x0, y0)
+    GaussianParams fixed_params;
+    fixed_params.A = A_fit;
+    fixed_params.sigma_x = sigma_x_fit;
+    fixed_params.sigma_y = sigma_y_fit;
+    fixed_params.rho = rho_fit;
+
+    // Create scanner and perform scan
+    LikelihoodScanner scanner;
+    scanner.setData(hist);
+    LikelihoodScan2DResult scan_result = scanner.scan2D(
+        fixed_params, x0_center, y0_center,
+        x0_range, y0_range, nx_scan, ny_scan
+    );
+
+    // Set output parameters
+    *nx_out = nx_scan;
+    *ny_out = ny_scan;
+    *likelihood_size_out = nx_scan * ny_scan;
+
+    // Allocate result array
+    // Layout: [7 summary values] [nx_scan x0 values] [ny_scan y0 values] [nx_scan*ny_scan likelihood values]
+    int total_size = 7 + nx_scan + ny_scan + nx_scan * ny_scan;
+    float* result_array = new float[total_size];
+
+    // Summary values
+    result_array[0] = scan_result.min_likelihood;
+    result_array[1] = scan_result.x0_at_min;
+    result_array[2] = scan_result.y0_at_min;
+    result_array[3] = scan_result.x0_error_plus;
+    result_array[4] = scan_result.x0_error_minus;
+    result_array[5] = scan_result.y0_error_plus;
+    result_array[6] = scan_result.y0_error_minus;
+
+    // x0 values
+    for (int i = 0; i < nx_scan; i++) {
+        result_array[7 + i] = scan_result.x0_values[i];
+    }
+
+    // y0 values
+    for (int j = 0; j < ny_scan; j++) {
+        result_array[7 + nx_scan + j] = scan_result.y0_values[j];
+    }
+
+    // likelihood grid
+    for (int i = 0; i < nx_scan * ny_scan; i++) {
+        result_array[7 + nx_scan + ny_scan + i] = scan_result.likelihood[i];
+    }
+
+    // Clean up histogram data
+    cudaFree(hist.data);
+
+    return result_array;
+}
+
+/**
+ * Free likelihood scan result
+ */
+extern "C" void free_likelihood_scan_ctypes(float* data) {
+    delete[] data;
+}

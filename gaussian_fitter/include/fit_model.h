@@ -128,4 +128,61 @@ public:
     OptimizationResult optimize(const GaussianParams& initial_params) override;
 };
 
+/**
+ * 2D似然扫描结果
+ */
+struct LikelihoodScan2DResult {
+    std::vector<float> x0_values;      // x0扫描点
+    std::vector<float> y0_values;      // y0扫描点
+    std::vector<float> likelihood;     // 似然值网格 (nx × ny)
+    int nx;                            // x0方向扫描点数
+    int ny;                            // y0方向扫描点数
+    float min_likelihood;              // 最小似然值
+    float x0_at_min;                   // 最小似然处的x0
+    float y0_at_min;                   // 最小似然处的y0
+    float x0_error_plus;               // x0正误差 (1σ)
+    float x0_error_minus;              // x0负误差 (1σ)
+    float y0_error_plus;               // y0正误差 (1σ)
+    float y0_error_minus;              // y0负误差 (1σ)
+};
+
+/**
+ * 2D似然函数扫描器
+ * 用于绘制似然函数等值线和参数置信区域
+ */
+class LikelihoodScanner {
+private:
+    const int* d_observed;
+    int nbins;
+    float x_min, x_max, y_min, y_max;
+    int nx, ny;
+    float* d_expected;
+    float* d_likelihood;
+
+    float computeLikelihood(const GaussianParams& params);
+
+public:
+    LikelihoodScanner();
+    ~LikelihoodScanner();
+
+    void setData(const Histogram2D& hist);
+
+    /**
+     * 在(x0, y0)二维参数空间中扫描似然函数
+     * @param fixed_params 固定的参数 (A, sigma_x, sigma_y, rho)
+     * @param x0_center x0扫描中心
+     * @param y0_center y0扫描中心
+     * @param x0_range x0扫描范围 (±)
+     * @param y0_range y0扫描范围 (±)
+     * @param nx x0方向扫描点数
+     * @param ny y0方向扫描点数
+     */
+    LikelihoodScan2DResult scan2D(
+        const GaussianParams& fixed_params,
+        float x0_center, float y0_center,
+        float x0_range, float y0_range,
+        int nx, int ny
+    );
+};
+
 #endif // FIT_MODEL_H

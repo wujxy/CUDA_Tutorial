@@ -576,3 +576,226 @@ OptimizationResult AdamOptimizer::optimize(const GaussianParams& initial_params)
 
     return result;
 }
+
+// ============================================================================
+// LikelihoodScanner Implementation
+// ============================================================================
+
+LikelihoodScanner::LikelihoodScanner()
+    : d_observed(nullptr), nbins(0),
+      x_min(0), x_max(0), y_min(0), y_max(0), nx(0), ny(0),
+      d_expected(nullptr), d_likelihood(nullptr)
+{
+}
+
+LikelihoodScanner::~LikelihoodScanner() {
+    if (d_expected) cudaFree(d_expected);
+    if (d_likelihood) cudaFree(d_likelihood);
+}
+
+void LikelihoodScanner::setData(const Histogram2D& hist) {
+    this->d_observed = hist.data;
+    this->nbins = hist.nx * hist.ny;
+    this->nx = hist.nx;
+    this->ny = hist.ny;
+    this->x_min = hist.x_min;
+    this->x_max = hist.x_max;
+    this->y_min = hist.y_min;
+    this->y_max = hist.y_max;
+
+    // 分配设备内存
+    CUDA_CHECK(cudaMalloc(&d_expected, nbins * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_likelihood, nbins * sizeof(float)));
+}
+
+float LikelihoodScanner::computeLikelihood(const GaussianParams& params) {
+    // 计算期望值
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (nbins + threadsPerBlock - 1) / threadsPerBlock;
+    poissonLikelihoodKernel<<<blocksPerGrid, threadsPerBlock>>>(
+        d_expected, d_likelihood, d_observed,
+        params, nbins,
+        x_min, x_max, nx,
+        y_min, y_max, ny
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // 规约求和 (与 SimpleOptimizer 相同的方法)
+    int num_blocks = blocksPerGrid;
+    float* d_temp;
+    CUDA_CHECK(cudaMalloc(&d_temp, num_blocks * sizeof(float)));
+
+    sumKernel<<<num_blocks, threadsPerBlock, threadsPerBlock * sizeof(float)>>>(
+        d_temp, d_likelihood, nbins
+    );
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    while (num_blocks > 1) {
+        int prev_blocks = num_blocks;
+        num_blocks = (num_blocks + threadsPerBlock - 1) / threadsPerBlock;
+
+        sumKernel<<<num_blocks, threadsPerBlock, threadsPerBlock * sizeof(float)>>>(
+            d_expected, d_temp, prev_blocks
+        );
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        float* swap = d_temp;
+        d_temp = d_expected;
+        d_expected = swap;
+    }
+
+    float result;
+    CUDA_CHECK(cudaMemcpy(&result, d_temp, sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d_temp));
+
+    return result;
+}
+
+LikelihoodScan2DResult LikelihoodScanner::scan2D(
+    const GaussianParams& fixed_params,
+    float x0_center, float y0_center,
+    float x0_range, float y0_range,
+    int nx, int ny
+) {
+    LikelihoodScan2DResult result;
+    result.nx = nx;
+    result.ny = ny;
+    result.likelihood.resize(nx * ny);
+    result.x0_values.resize(nx);
+    result.y0_values.resize(ny);
+
+    // 生成扫描点
+    for (int i = 0; i < nx; i++) {
+        result.x0_values[i] = x0_center - x0_range + 2.0f * x0_range * i / (nx - 1);
+    }
+    for (int j = 0; j < ny; j++) {
+        result.y0_values[j] = y0_center - y0_range + 2.0f * y0_range * j / (ny - 1);
+    }
+
+    result.min_likelihood = 1e30f;
+    int min_idx = 0;
+
+    // 扫描所有 (x0, y0) 组合
+    printf("\n=== 2D Likelihood Scan ===\n");
+    printf("Scanning %dx%d = %d points...\n", nx, ny, nx * ny);
+
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            GaussianParams params = fixed_params;
+            params.x0 = result.x0_values[i];
+            params.y0 = result.y0_values[j];
+
+            float likelihood = computeLikelihood(params);
+            result.likelihood[j * nx + i] = likelihood;
+
+            if (likelihood < result.min_likelihood) {
+                result.min_likelihood = likelihood;
+                result.x0_at_min = params.x0;
+                result.y0_at_min = params.y0;
+                min_idx = j * nx + i;
+            }
+        }
+        printf("Progress: %d/%d rows completed\n", j + 1, ny);
+    }
+
+    printf("Minimum likelihood: %.6f at (x0=%.4f, y0=%.4f)\n",
+           result.min_likelihood, result.x0_at_min, result.y0_at_min);
+
+    // 使用 Δχ² = 1 确定 1σ 置信区域
+    float threshold = result.min_likelihood + 1.0f;
+
+    // 找到最小值在网格中的位置
+    int min_idx_i = 0, min_idx_j = 0;
+    for (int j = 0; j < ny; j++) {
+        for (int i = 0; i < nx; i++) {
+            if (result.likelihood[j * nx + i] < result.likelihood[min_idx_j * nx + min_idx_i]) {
+                min_idx_i = i;
+                min_idx_j = j;
+            }
+        }
+    }
+
+    // 在 y0 ≈ y0_at_min 这一行找 x0 的误差
+    // 向左找（likelihood 从小于阈值到大于阈值）
+    result.x0_error_minus = x0_range;  // 默认值：扫描范围
+    for (int i = min_idx_i - 1; i >= 0; i--) {
+        int idx = min_idx_j * nx + i;
+        if (result.likelihood[idx] >= threshold) {
+            // 在 i 和 i+1 之间插值
+            float x1 = result.x0_values[i];
+            float x2 = result.x0_values[i + 1];
+            float y1 = result.likelihood[idx];
+            float y2 = result.likelihood[idx + 1];
+
+            float t = (threshold - y1) / (y2 - y1);
+            float x_intersect = x1 + t * (x2 - x1);
+            result.x0_error_minus = result.x0_at_min - x_intersect;
+            break;
+        }
+    }
+
+    // 向右找
+    result.x0_error_plus = x0_range;  // 默认值：扫描范围
+    for (int i = min_idx_i + 1; i < nx; i++) {
+        int idx = min_idx_j * nx + i;
+        if (result.likelihood[idx] >= threshold) {
+            // 在 i-1 和 i 之间插值
+            float x1 = result.x0_values[i - 1];
+            float x2 = result.x0_values[i];
+            float y1 = result.likelihood[idx - 1];
+            float y2 = result.likelihood[idx];
+
+            float t = (threshold - y1) / (y2 - y1);
+            float x_intersect = x1 + t * (x2 - x1);
+            result.x0_error_plus = x_intersect - result.x0_at_min;
+            break;
+        }
+    }
+
+    // 在 x0 ≈ x0_at_min 这一列找 y0 的误差
+    // 向下找
+    result.y0_error_minus = y0_range;  // 默认值：扫描范围
+    for (int j = min_idx_j - 1; j >= 0; j--) {
+        int idx = j * nx + min_idx_i;
+        if (result.likelihood[idx] >= threshold) {
+            // 在 j 和 j+1 之间插值
+            float y1 = result.y0_values[j];
+            float y2 = result.y0_values[j + 1];
+            float l1 = result.likelihood[idx];
+            float l2 = result.likelihood[idx + nx];
+
+            float t = (threshold - l1) / (l2 - l1);
+            float y_intersect = y1 + t * (y2 - y1);
+            result.y0_error_minus = result.y0_at_min - y_intersect;
+            break;
+        }
+    }
+
+    // 向上找
+    result.y0_error_plus = y0_range;  // 默认值：扫描范围
+    for (int j = min_idx_j + 1; j < ny; j++) {
+        int idx = j * nx + min_idx_i;
+        if (result.likelihood[idx] >= threshold) {
+            // 在 j-1 和 j 之间插值
+            float y1 = result.y0_values[j - 1];
+            float y2 = result.y0_values[j];
+            float l1 = result.likelihood[idx - nx];
+            float l2 = result.likelihood[idx];
+
+            float t = (threshold - l1) / (l2 - l1);
+            float y_intersect = y1 + t * (y2 - y1);
+            result.y0_error_plus = y_intersect - result.y0_at_min;
+            break;
+        }
+    }
+
+    printf("Error estimates (Δχ² = 1):\n");
+    printf("  x0: %.4f + %.4f - %.4f\n", result.x0_at_min, result.x0_error_plus, result.x0_error_minus);
+    printf("  y0: %.4f + %.4f - %.4f\n", result.y0_at_min, result.y0_error_plus, result.y0_error_minus);
+    printf("=====================================\n\n");
+
+    return result;
+}
