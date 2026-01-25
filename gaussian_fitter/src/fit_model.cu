@@ -438,14 +438,6 @@ OptimizationResult AdamOptimizer::optimize(const GaussianParams& initial_params)
         printParams("Initial", result.params);
     }
 
-    // Adam 参数缩放因子（与 SimpleOptimizer 保持一致）
-    const float scale_A = 1.0f;
-    const float scale_x0 = 0.01f;
-    const float scale_y0 = 0.01f;
-    const float scale_sigma_x = 0.001f;
-    const float scale_sigma_y = 0.001f;
-    const float scale_rho = 0.01f;
-
     for (int iter = 0; iter < config.max_iterations; iter++) {
         // 记录迭代开始时间
         auto iter_start = std::chrono::high_resolution_clock::now();
@@ -459,15 +451,9 @@ OptimizationResult AdamOptimizer::optimize(const GaussianParams& initial_params)
         float old_likelihood = current_likelihood;
 
         // Adam 更新规则
-        // g_t = gradient * scale (缩放以适应不同参数的尺度)
-        float g[6] = {
-            gradient[0] * scale_A,
-            gradient[1] * scale_x0,
-            gradient[2] * scale_y0,
-            gradient[3] * scale_sigma_x,
-            gradient[4] * scale_sigma_y,
-            gradient[5] * scale_rho
-        };
+        // 注意：Adam 有自适应学习率机制，直接使用原始梯度，不需要额外缩放
+        // （Simple GD 需要缩放是因为不同参数的梯度尺度差异很大）
+        const float* g = gradient;  // 直接使用原始梯度
 
         // 更新一阶矩和二阶矩
         float beta1 = config.beta1;

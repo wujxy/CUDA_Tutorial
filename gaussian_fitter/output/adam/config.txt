@@ -28,15 +28,18 @@
   rho = 0.25
 
 [optimizer]
-  optimizer_type = simple
-  learning_rate = 1e-05
-  max_iterations = 20000
-  tolerance = 1e-05
+  optimizer_type = adam
+  learning_rate = 0.01
+  max_iterations = 100000
+  tolerance = 1e-06
   gradient_epsilon = 0.0001
   verbose = True
   timing_save_interval = 100
+  beta1 = 0.9
+  beta2 = 0.999
+  epsilon = 1e-08
 
 [output]
-  output_dir = output
+  output_dir = output/adam
   timing_save_interval = 100
   save_plots = True
